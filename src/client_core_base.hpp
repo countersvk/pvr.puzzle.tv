@@ -1,186 +1,123 @@
-/*
- *
- *   Copyright (C) 2017 Sergey Shramchenko
- *   https://github.com/srg70/pvr.puzzle.tv
- *
- *  This Program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
- *  any later version.
- *
- *  This Program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with XBMC; see the file COPYING.  If not, write to
- *  the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
- *  http://www.gnu.org/copyleft/gpl.html
- *
- */
+#pragma once
 
-#ifndef client_core_base_hpp
-#define client_core_base_hpp
-
-#include "pvr_client_types.h"
-#include <rapidjson/document.h>
-#include "ActionQueueTypes.hpp"
+#include <memory>
+#include <string>
+#include <unordered_map>
 #include <functional>
-#include "globals.hpp"
-
-class HttpEngine;
-
-namespace XMLTV {
-    struct EpgEntry;
-    struct EpgChannel;
-}
+#include <chrono>
+#include <mutex>
+#include <shared_mutex>
+#include <span>
+#include <optional>
+#include <kodi/AddonBase.h>
+#include <rapidjson/document.h>
+#include "pvr_client_types.h"
+#include "ActionQueueTypes.hpp"
 
 namespace PvrClient {
+
+namespace chrono = std::chrono;
+using namespace std::chrono_literals;
+
+class ClientCoreBase : public IClientCore {
+public:
+    explicit ClientCoreBase(RecordingsDelegate recordings_delegate = nullptr);
+    virtual ~ClientCoreBase() = default;
+
+    void InitAsync(bool clear_epg_cache, bool update_recordings) override;
     
-    class ClientPhase;
-    class ClientCoreBase :  public IClientCore
-    {
-    public:
-        void InitAsync(bool clearEpgCache, bool updateRecordings);
-        
-        virtual std::shared_ptr<IPhase> GetPhase(Phase phase);
-        
-        virtual ~ClientCoreBase();
-        
-        const ChannelList &GetChannelList();
-        const GroupList &GetGroupList();
-        GroupId GroupForChannel(ChannelId chId);
-        void RebuildChannelAndGroupList();
-
-        void ReloadRecordings();
-        int UpdateArchiveInfoAndCount();
-
-        bool GetEpgEntry(UniqueBroadcastIdType i,  EpgEntry& enrty);
-        void ForEachEpgLocked(const EpgEntryAction& action) const;
-        void ForEachEpgUnlocked(const EpgEntryAction& predicate, const EpgEntryAction& action) const;
-        void GetEpg(ChannelId channelId, time_t startTime, time_t endTime, EpgEntryAction& onEpgEntry);
-        
-        void SetRpcSettings(const RpcSettings& settings) {m_rpcSettings = settings;}
-        void CheckRpcConnection();
-        void CallRpcAsync(const std::string & data, std::function<void(rapidjson::Document&)>  parser,
-                          ActionQueue::TCompletion completion);
-        void IncludeCurrentEpgToArchive(AddCurrentEpgToArchive add) {m_addCurrentEpgToArchive = add;}
-        void SetEpgCorrectionShift(int shift) {m_epgCorrectuonShift = shift; }
-        void SetLocalLogosFolder(const std::string& logosFolder) {
-            m_LocalLogosFolder = logosFolder;
-            if(!m_LocalLogosFolder.empty() && m_LocalLogosFolder[m_LocalLogosFolder.size() - 1] == PATH_SEPARATOR_CHAR)
-                m_LocalLogosFolder.pop_back();
-        }
-        void SupportMuticastUrls(bool shouldSupport, const std::string& udpProxyHost = std::string(), uint32_t udpProxyPort = 0) {
-            m_supportMulticastUrls = shouldSupport;
-            m_multicastProxyAddress = std::string("http://") + udpProxyHost + ':' + std::to_string(udpProxyPort);
-        }
-
-        static bool ReadFileContent(const char* cacheFile, std::string& buffer);
-        
-        // abstract methods
-        virtual void UpdateEpgForAllChannels(time_t startTime, time_t endTime, std::function<bool(void)> cancelled) = 0;
-        virtual std::string GetUrl(ChannelId channelId) = 0;
-
-    protected:
-        ClientCoreBase(const RecordingsDelegate& didRecordingsUpadate = nullptr);
-        
-        // EPG methods
-        P8PLATFORM::CTimeout m_epgUpdateInterval;
-
-        static std::string MakeEpgCachePath(const char* cacheFile);
-        void ClearEpgCache(const char* cacheFile, const char* epgUrl);
-        void LoadEpgCache(const char* cacheFile);
-        void SaveEpgCache(const char* cacheFile, unsigned int daysToPreserve = 7);
-        UniqueBroadcastIdType AddEpgEntry(UniqueBroadcastIdType id, const EpgEntry& entry);
-        bool AddEpgEntry(const XMLTV::EpgEntry& xmlEpgEntry);
-//        void UpdateEpgEntry(UniqueBroadcastIdType id, const EpgEntry& entry);
-
-        // Channel & group lists
-        void AddChannel(const Channel& channel);
-        void AddGroup(GroupId groupId, const Group& group);
-        void AddChannelToGroup(GroupId groupId, ChannelId channelId);
-        void AddChannelToGroup(GroupId groupId, ChannelId channelId, int indexInGroup);
-        void SetLocalPathForLogo(Channel& channel) const;
-        void TranslateMulticastUrls(Channel::UrlList& urls) const;
-        std::string TranslateMultucastUrl(const std::string& url) const;
-        void ParseJson(const std::string& response, std::function<void(rapidjson::Document&)> parser);
-        
-        // Should be called from destructor of dirived class
-        void PrepareForDestruction();
-        
-        // Required methods to implement for derived classes
-        virtual void Init(bool clearEpgCache) = 0;
-        virtual void UpdateHasArchive(EpgEntry& entry) = 0;
-        // Do not call directly, only through RebuildChannelAndGroupList()
-        virtual void BuildChannelAndGroupList() = 0;
-
-        
-        HttpEngine* m_httpEngine;
-        const ChannelList & m_channelList;
-        const GroupList& m_groupList;
-        AddCurrentEpgToArchive m_addCurrentEpgToArchive;
-        int m_epgCorrectuonShift;
-
-    private:
-        // Multicast URL
-        std::string TransformMultucastUrl(const std::string& url) const;
-        
-        // Recordings
-        void OnEpgUpdateDone();
-        void _UpdateEpgForAllChannels(time_t startTime, time_t endTime, std::function<bool(void)> cancelled);
-        void CallRpcAsyncImpl(const std::string & data, std::function<void(rapidjson::Document&)>  parser, ActionQueue::TCompletion completion);
-        inline UniqueBroadcastIdType AddEpgEntryInternal(UniqueBroadcastIdType id, const EpgEntry& entry, EpgEntry** pAddedEntry = nullptr);
-
-        ChannelList m_mutableChannelList;
-        GroupList m_mutableGroupList;
-        std::map<ChannelId, GroupId> m_channelToGroupLut;
-
-        
-        EpgEntryList m_epgEntries;
-        mutable P8PLATFORM::CMutex m_epgAccessMutex;
-        
-        RecordingsDelegate m_didRecordingsUpadate;
-        
-        typedef std::map<IClientCore::Phase, std::shared_ptr<ClientPhase> > TPhases;
-        TPhases m_phases;
-        P8PLATFORM::CMutex m_phasesAccessMutex;
-
-        
-        time_t m_lastEpgRequestEndTime;
-        RpcSettings m_rpcSettings;
-        bool m_rpcWorks;
-        bool m_destructionRequested;
-        std::string m_LocalLogosFolder;
-        bool m_supportMulticastUrls;
-        std::string m_multicastProxyAddress;
-    };
+    std::shared_ptr<IPhase> GetPhase(Phase phase) override;
     
-    class ExceptionBase : public std::exception
-    {
-    public:
-        const char* what() const noexcept {return reason.c_str();}
-        const std::string reason;
-        ExceptionBase(const std::string& r) : reason(r) {}
-        ExceptionBase(const char* r = "") : reason(r) {}
-        
-    };
+    // Channel and group management
+    const ChannelList& GetChannelList() override;
+    const GroupList& GetGroupList() override;
+    GroupId GroupForChannel(ChannelId ch_id) override;
+    void RebuildChannelAndGroupList() override;
+
+    // EPG management
+    bool GetEpgEntry(UniqueBroadcastIdType id, EpgEntry& entry) override;
+    void GetEpg(ChannelId channel_id, chrono::system_clock::time_point start, 
+               chrono::system_clock::time_point end, EpgEntryAction& on_epg_entry) override;
+
+    // RPC configuration
+    void SetRpcSettings(RpcSettings settings) { m_rpc_settings = std::move(settings); }
+    void CheckRpcConnection();
     
-    class JsonParserException : public ExceptionBase
-    {
-    public:
-        JsonParserException(const std::string& r) : ExceptionBase(r) {}
-        JsonParserException(const char* r) : ExceptionBase(r) {}
-    };
-    class RpcCallException : public ExceptionBase
-    {
-    public:
-        RpcCallException(const std::string& r) : ExceptionBase(r) {}
-        RpcCallException(const char* r) : ExceptionBase(r) {}
+    // Other configurations
+    void SetEpgCorrectionShift(chrono::seconds shift) { m_epg_correction = shift; }
+    void SupportMulticastUrls(bool support, std::string_view proxy_host = {}, uint16_t proxy_port = 0);
+
+protected:
+    struct EpgCache {
+        std::filesystem::path path;
+        chrono::system_clock::time_point expiration;
     };
 
-    
-}
+    // Abstract interface
+    virtual void UpdateEpgForAllChannels(chrono::system_clock::time_point start, 
+                                        chrono::system_clock::time_point end,
+                                        std::stop_token stop_token) = 0;
+    virtual std::string GetUrl(ChannelId channel_id) = 0;
 
-#endif /* client_core_base_hpp */
+    // Helper methods
+    void LoadEpgCache(std::string_view cache_file);
+    void SaveEpgCache(std::string_view cache_file, chrono::hours ttl = 7*24h);
+    
+    void AddChannel(Channel channel);
+    void AddGroup(GroupId group_id, Group group);
+    void UpdateChannelLogo(Channel& channel) const;
+
+private:
+    // Implementation details
+    struct PhaseData {
+        std::shared_ptr<ClientPhase> phase;
+        std::shared_mutex mutex;
+    };
+
+    void InitializeComponents(bool clear_epg_cache);
+    void ScheduleEpgUpdate();
+    void ProcessEpgEntries(std::span<const EpgEntry> entries);
+
+    // Data members
+    std::unique_ptr<HttpEngine> m_http_engine;
+    std::unordered_map<Phase, PhaseData> m_phases;
+    
+    ChannelList m_channels;
+    GroupList m_groups;
+    std::unordered_map<ChannelId, GroupId> m_channel_group_map;
+    
+    std::unordered_map<UniqueBroadcastIdType, EpgEntry> m_epg_entries;
+    mutable std::shared_mutex m_epg_mutex;
+    
+    RecordingsDelegate m_recordings_delegate;
+    RpcSettings m_rpc_settings;
+    chrono::seconds m_epg_correction{0};
+    
+    std::string m_local_logos_path;
+    bool m_support_multicast = false;
+    std::string m_multicast_proxy;
+};
+
+// Modern exception hierarchy
+class PvrException : public std::exception {
+public:
+    explicit PvrException(std::string_view message)
+        : m_message(message) {}
+    
+    const char* what() const noexcept override { return m_message.c_str(); }
+
+private:
+    std::string m_message;
+};
+
+class JsonError : public PvrException {
+public:
+    using PvrException::PvrException;
+};
+
+class RpcError : public PvrException {
+public:
+    using PvrException::PvrException;
+};
+
+} // namespace PvrClient
