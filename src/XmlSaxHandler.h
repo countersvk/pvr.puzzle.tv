@@ -1,99 +1,88 @@
-//
-//  XmlSaxHandler.h
-//  pvr.puzzle.tv
-//
-//  Created by Sergey Shramchenko on 31/10/2020.
-//  Copyright © 2020 Home. All rights reserved.
-//
+#ifndef XML_SAX_HANDLER_H
+#define XML_SAX_HANDLER_H
 
-#ifndef XmlSaxHandler_h
-#define XmlSaxHandler_h
-
+#include <memory>
 #include <type_traits>
+#include <kodi/Log.h>
+
 #define XML_STATIC 1
 #include "expat.h"
-#include "globals.hpp"
-
-
-#ifdef XML_LARGE_SIZE
-#  define XML_FMT_INT_MOD "ll"
-#else
-#  define XML_FMT_INT_MOD "l"
-#endif
-
-#ifdef XML_UNICODE_WCHAR_T
-#  include <wchar.h>
-#  define XML_FMT_STR "ls"
-#else
-#  define XML_FMT_STR "s"
-#endif
-
 
 namespace XMLTV {
 
 template<typename Derived = void>
-class XmlEventHandler
+class XmlSaxHandler
 {
 public:
-    typedef typename std::conditional<std::is_same<Derived, void>::value, XmlEventHandler, Derived>::type Override;
+    using Override = std::conditional_t<
+        std::is_same_v<Derived, void>, 
+        XmlSaxHandler, 
+        Derived
+    >;
 
-    XmlEventHandler()
+    XmlSaxHandler()
+        : m_parser(XML_ParserCreate(nullptr), &XML_ParserFree)
     {
-        _parser = XML_ParserCreate(NULL);
-        XML_SetElementHandler(_parser, StartElement, EndElement);
-        XML_SetUserData(_parser, this);
-        XML_SetCharacterDataHandler(_parser, CharacterDataHandler);
+        XML_SetElementHandler(m_parser.get(), StartElement, EndElement);
+        XML_SetCharacterDataHandler(m_parser.get(), CharacterDataHandler);
+        XML_SetUserData(m_parser.get(), this);
     }
-    ~XmlEventHandler()
-    {
-        XML_ParserFree(_parser);
-    }
-    
-    bool Default() { return true; }
-    bool Element(const XML_Char *name, const XML_Char **attributes) { return static_cast<Override&>(*this).Default(); }
-    bool ElementData(const XML_Char *data, int length) { return static_cast<Override&>(*this).Default(); }
-    bool ElementEnd(const XML_Char *name) { return static_cast<Override&>(*this).Default(); }
 
-    
-    bool Parse(const char *buffer, int size, bool isFinal) {
-        if (XML_STATUS_ERROR == XML_Parse(_parser, buffer, size, isFinal)) {
-             Globals::LogError("%" XML_FMT_STR " at line %" XML_FMT_INT_MOD "u\n",
-                               XML_ErrorString(XML_GetErrorCode(_parser)),
-                               XML_GetCurrentLineNumber(_parser));
+    [[nodiscard]] bool Parse(const char* buffer, size_t size, bool isFinal)
+    {
+        if (XML_Parse(m_parser.get(), buffer, static_cast<int>(size), isFinal ? XML_TRUE : XML_FALSE) 
+            == XML_STATUS_ERROR)
+        {
+            LogError(XML_GetErrorCode(m_parser.get()));
             return false;
         }
         return true;
     }
-    
+
+protected:
+    virtual bool Element(const XML_Char* /*name*/, const XML_Char** /*attrs*/) { return true; }
+    virtual bool ElementEnd(const XML_Char* /*name*/) { return true; }
+    virtual bool ElementData(const XML_Char* /*data*/, int /*length*/) { return true; }
+
 private:
-    void OnError()
+    struct ParserDeleter {
+        void operator()(XML_Parser parser) const noexcept { XML_ParserFree(parser); }
+    };
+    std::unique_ptr<XML_ParserStruct, ParserDeleter> m_parser;
+
+    void LogError(XML_Error errorCode) const noexcept
     {
-        XML_StopParser(_parser, false);
+        kodi::Log(ADDON_LOG_ERROR, "XML parsing error [%d]: %s at line %lu",
+                  static_cast<int>(errorCode),
+                  XML_ErrorString(errorCode),
+                  XML_GetCurrentLineNumber(m_parser.get()));
     }
-    
-    static void XMLCALL StartElement(void *userData, const XML_Char *name, const XML_Char **atts)
+
+    static void XMLCALL StartElement(void* userData, const XML_Char* name, const XML_Char** attrs) noexcept
     {
-        Override* pThis = (Override*)userData;
-        if(!pThis->Element(name, atts))
-            pThis->OnError();
+        auto* self = static_cast<Override*>(userData);
+        if (!self->Element(name, attrs)) {
+            XML_StopParser(self->m_parser.get(), XML_FALSE);
+        }
     }
-    static void XMLCALL EndElement(void *userData, const XML_Char *name)
+
+    static void XMLCALL EndElement(void* userData, const XML_Char* name) noexcept
     {
-        Override* pThis = (Override*)userData;
-        if(!pThis->ElementEnd(name))
-            pThis->OnError();
+        auto* self = static_cast<Override*>(userData);
+        if (!self->ElementEnd(name)) {
+            XML_StopParser(self->m_parser.get(), XML_FALSE);
+        }
     }
-    static void XMLCALL CharacterDataHandler(void *userData, const XML_Char *buffer, int size)
+
+    static void XMLCALL CharacterDataHandler(void* userData, const XML_Char* data, int len) noexcept
     {
-        Override* pThis = (Override*)userData;
-        if(!pThis->ElementData(buffer, size))
-            pThis->OnError();
+        auto* self = static_cast<Override*>(userData);
+        if (!self->ElementData(data, len)) {
+            XML_StopParser(self->m_parser.get(), XML_FALSE);
+        }
     }
-    
-    XML_Parser _parser;
 };
 
-}
+} // namespace XMLTV
 
-
-#endif /* XmlSaxHandler_h */
+#endif // XML_SAX_HANDLER_H
