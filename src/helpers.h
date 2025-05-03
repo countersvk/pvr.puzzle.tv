@@ -1,68 +1,78 @@
-/*
- *
- *   Copyright (C) 2017 Sergey Shramchenko
- *   https://github.com/srg70/pvr.puzzle.tv
- *
- *  Copyright (C) 2013 Alex Deryskyba (alex@codesnake.com)
- *  https://bitbucket.org/codesnake/pvr.sovok.tv_xbmc_addon
- *
- *
- *  This Program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
- *  any later version.
- *
- *  This Program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with XBMC; see the file COPYING.  If not, write to
- *  the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
- *  http://www.gnu.org/copyleft/gpl.html
- *
- */
-
-#ifndef helpers_h
-#define helpers_h
-
+#ifndef HELPERS_H
+#define HELPERS_H
 
 #include <string>
-#include <stdint.h>
-#include <cctype>
-#include <ctime>
+#include <string_view>
+#include <chrono>
+#include <format>
 #include <algorithm>
+#include <cctype>
+#include <charconv>
+#include <rapidjson/document.h>
+#include <rapidjson/prettywriter.h>
+#include <gsl/gsl_util> // Для gsl::narrow_cast
 
 namespace Helpers {
 
-template <class T>
-void dump_json(const T& jValue);
-
-std::string n_to_string(int64_t n);
-std::string n_to_string_hex(uint64_t n);
-std:: string time_t_to_string(const time_t& time);
-//int strtoi(const std::string &str);
-
-// trim from start (in place)
-inline void ltrim(std::string &s) {
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](char ch) {
-        return !std::isspace(ch);
-    }));
+// Универсальное преобразование чисел в строку
+template<typename T>
+std::string n_to_string(T value) noexcept {
+    char buffer[64]{};
+    auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), value);
+    if (ec == std::errc()) return {buffer, ptr};
+    return {};
 }
 
-// trim from end (in place)
-inline void rtrim(std::string &s) {
-    s.erase(std::find_if(s.rbegin(), s.rend(), [](char ch) {
-        return !std::isspace(ch);
-    }).base(), s.end());
+// Специализация для шестнадцатеричного представления
+template<typename T>
+std::string n_to_string_hex(T value) noexcept {
+    return std::format("{:x}", value);
 }
 
-// trim from both ends (in place)
-inline void trim(std::string &s) {
-    ltrim(s);
-    rtrim(s);
+// Преобразование времени с использованием <chrono>
+inline std::string time_t_to_string(
+    const std::chrono::system_clock::time_point& tp) noexcept 
+{
+    try {
+        return std::format("{:%d/%m/%y %H:%M}", tp);
+    } catch (...) {
+        return "Invalid time";
+    }
 }
 
+// Шаблонная функция для дебага JSON
+template <typename T>
+void dump_json(const T& jValue) noexcept {
+    rapidjson::StringBuffer sb;
+    rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(sb);
+    if (jValue.Accept(writer)) {
+        std::cout << sb.GetString() << '\n';
+    }
 }
-#endif //helpers_h
+
+// Тримминг строк с использованием string_view
+inline std::string_view ltrim(std::string_view s) noexcept {
+    auto it = std::find_if(s.begin(), s.end(), [](char c) {
+        return !std::isspace(static_cast<unsigned char>(c));
+    });
+    return {it, s.end()};
+}
+
+inline std::string_view rtrim(std::string_view s) noexcept {
+    auto it = std::find_if(s.rbegin(), s.rend(), [](char c) {
+        return !std::isspace(static_cast<unsigned char>(c));
+    }).base();
+    return {s.begin(), it};
+}
+
+inline std::string_view trim(std::string_view s) noexcept {
+    return ltrim(rtrim(s));
+}
+
+// Явные инстанцирования для JSON типов
+template void dump_json<rapidjson::Document>(const rapidjson::Document&);
+template void dump_json<rapidjson::Value>(const rapidjson::Value&);
+
+} // namespace Helpers
+
+#endif // HELPERS_H
