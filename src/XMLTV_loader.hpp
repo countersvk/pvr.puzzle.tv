@@ -1,80 +1,78 @@
-/*
- *
- *   Copyright (C) 2017 Sergey Shramchenko
- *   https://github.com/srg70/pvr.puzzle.tv
- *
- *   Copyright (C) 2013-2015 Anton Fedchin
- *   http://github.com/afedchin/xbmc-addon-iptvsimple/
- *
- *   Copyright (C) 2011 Pulse-Eight
- *   http://www.pulse-eight.com/
- *
- *  This Program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
- *  any later version.
- *
- *  This Program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with XBMC; see the file COPYING.  If not, write to
- *  the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
- *  http://www.gnu.org/copyleft/gpl.html
- *
- */
-
-#ifndef XMLTV_loader_hpp
-#define XMLTV_loader_hpp
+#ifndef XMLTV_LOADER_HPP
+#define XMLTV_LOADER_HPP
 
 #include <string>
-#include <list>
+#include <vector>
 #include <functional>
-#include "pvr_client_types.h"
+#include <chrono>
+#include <filesystem>
+#include <memory>
+#include <kodi/AddonBase.h>
+#include <kodi/Filesystem.h>
+#include <kodi/addon/pvr/EPG.h>
 
 namespace XMLTV {
-  
-    struct EpgChannel
-    {
-        EpgChannel()
-        : id(PvrClient::UnknownChannelId)
-        {}
-        PvrClient::ChannelId     id;
-        std::list<std::string>   displayNames;
-        std::string         strIcon;
-    };
+    namespace fs = std::filesystem;
+    using namespace std::chrono;
 
-    struct EpgEntry
-    {
-        EpgEntry()
-        : EpgId(PvrClient::UnknownChannelId)
-        , startTime(0)
-        , endTime(0)
-        {}
-        PvrClient::ChannelId         EpgId;
-        time_t      startTime;
-        time_t      endTime;
-        std::string strTitle;
-        std::string strPlot;
-        std::string strGenreString;
+    struct EpgChannel {
+        EpgChannel() = default;
+        
+        kodi::addon::PVRChannelIdentifier id = KODI_INVALID_CHANNEL_ID;
+        std::vector<std::string> displayNames;
         std::string iconPath;
     };
-    typedef std::function<void(const EpgChannel& newChannel)> ChannelCallback;
-    typedef std::function<bool(const EpgEntry& newEntry)> EpgEntryCallback;
-    typedef std::function<int(char* buffer, unsigned int size)> DataReder;
-    typedef std::function<int(const char* buffer, unsigned int size)> DataWriter;
 
-    PvrClient::KodiChannelId ChannelIdForChannelName(const std::string& strId);
-    PvrClient::KodiChannelId EpgChannelIdForXmlEpgId(const char* strId);
+    struct EpgEntry {
+        kodi::addon::PVRChannelIdentifier channelId = KODI_INVALID_CHANNEL_ID;
+        time_point<system_clock> startTime;
+        time_point<system_clock> endTime;
+        std::string title;
+        std::string plot;
+        std::string genre;
+        std::string iconPath;
+    };
 
-    bool ParseChannels(const std::string& url,  const ChannelCallback& onChannelFound);
-    bool ParseEpg(const std::string& url,  const EpgEntryCallback& onEpgEntryFound);
+    using ChannelHandler = std::function<void(const EpgChannel&)>;
+    using EpgEntryHandler = std::function<bool(const EpgEntry&)>;
 
-    long LocalTimeOffset();
-    bool GetCachedFileContents(const std::string &filePath, DataWriter writer, bool forceReleoad = false);
-    std::string GetCachedPathFor(const std::string& original);
+    class XmlTvLoader {
+    public:
+        explicit XmlTvLoader(std::string cacheDir = "special://temp/pvr-xmltv/")
+            : m_cacheDir(std::move(cacheDir)) 
+        {
+            kodi::vfs::CreateDirectory(m_cacheDir);
+        }
+
+        bool LoadChannels(const std::string& source, ChannelHandler handler);
+        bool LoadPrograms(const std::string& source, EpgEntryHandler handler);
+
+        static time_point<system_clock> ParseXmlDateTime(std::string_view dtStr);
+
+    private:
+        struct CacheInfo {
+            fs::path path;
+            bool valid = false;
+            system_clock::time_point expiration;
+        };
+
+        fs::path m_cacheDir;
+        
+        CacheInfo GetCachedData(const std::string& source);
+        bool UpdateCache(const std::string& source, const fs::path& cachePath);
+        bool ProcessXml(const fs::path& xmlPath, ChannelHandler* channelHandler, EpgEntryHandler* programHandler);
+    };
+
+    // Хэш-функция для идентификаторов каналов
+    struct ChannelIdHash {
+        size_t operator()(const std::string& id) const {
+            return std::hash<std::string>{}(id);
+        }
+    };
+
+    // Вспомогательные функции времени
+    system_clock::time_point LocalTimeToUTC(const tm& localTime);
+    time_t LocalTimeOffset();
 }
 
-#endif /* XMLTV_loader_hpp */
+#endif // XMLTV_LOADER_HPP
