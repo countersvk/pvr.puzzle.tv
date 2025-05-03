@@ -21,72 +21,78 @@
  */
 
 #include "ActionQueue.hpp"
+#include <kodi/AddonBase.h> // Добавляем новый заголовок для Kodi 20+
+
+using namespace kodi; // Используем пространство имен Kodi
 
 namespace ActionQueue {
-    
-    
     
     static const int32_t INFINITE_QUEUE_TIMEOUT = 0x7FFFFFFF;
     
     void* CActionQueue::Process()
     {
-        // NOTE: Keep commented out! Debug code
-//        if(!_name.empty()){
-//            if (pthread_setname_np( _name.c_str()) != 0)
-//                Globals::LogError("pthread_setname_np failed!");
-//            _name.clear();
-//        }
+        // Активируем отладочное имя потока через API Kodi
+        if(!_name.empty()){
+            SetThreadName(GetCurrentThread(), _name.c_str());
+            _name.clear();
+        }
 
         while (!IsStopped() || (_willStop && !_actions.IsEmpty()))
         {
-            IActionQueueItem* action = NULL;
-            // Do not wait infinite when pipeline is stopped.
-            // Could be no new task will arrive, e.g. on StopThead()
+            IActionQueueItem* action = nullptr;
             if( _actions.Pop(action, (_willStop) ? 0 : INFINITE_QUEUE_TIMEOUT))
             {
-                if(NULL == action)
-                    continue;
-                if(_willStop)
-                    action->Cancel();
-                else
-                    action->Perform();
+                if(!action) continue;
+                
+                try {
+                    if(_willStop)
+                        action->Cancel();
+                    else
+                        action->Perform();
+                } 
+                catch (const std::exception& e) {
+                    Log(ADDON_LOG_ERROR, "Action failed: %s", e.what());
+                }
+                
                 delete action;
             }
-            // Check for priority task
-            if(_priorityAction) {
-                P8PLATFORM::CLockObject lock(_priorityActionMutex);
-                if(_priorityAction) {
-                    _priorityAction->Perform();
-                    delete _priorityAction;
-                    _priorityAction = nullptr;
-
-                }
-            }
             
+            // Обработка приоритетных задач с использованием std::mutex
+            std::lock_guard<std::mutex> lock(_priorityActionMutex);
+            if(_priorityAction) {
+                try {
+                    _priorityAction->Perform();
+                } 
+                catch (const std::exception& e) {
+                    Log(ADDON_LOG_ERROR, "Priority action failed: %s", e.what());
+                }
+                delete _priorityAction;
+                _priorityAction = nullptr;
+            }
         }
-        return NULL;
+        return nullptr;
     }
     
     void CActionQueue::TerminatePipeline()
     {
-        // In case of no active tasks unlocks .Pop() waiting
-        _willStop = false;
-        PerformAsync([this] {
-            _willStop = true;
-        }, [](const ActionResult& s) {});
+        std::lock_guard<std::mutex> lock(_stateMutex); // Добавляем синхронизацию
         _willStop = true;
-        
+        _actions.Interrupt(); // Новый метод для прерывания ожидания
     }
     
     bool CActionQueue::StopThread(int iWaitMs)
     {
         TerminatePipeline();
-        return this->CThread::StopThread(iWaitMs);
+        return Join(std::chrono::milliseconds(iWaitMs)); // Используем стандартный метод
     }
     
     CActionQueue::~CActionQueue(void)
     {
         StopThread(5000);
+        if (_priorityAction) {
+            delete _priorityAction;
+            _priorityAction = nullptr;
+        }
     }
     
 }
