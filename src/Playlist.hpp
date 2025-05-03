@@ -1,92 +1,87 @@
-/*
-*
-*   Copyright (C) 2018 Sergey Shramchenko
-*   https://github.com/srg70/pvr.puzzle.tv
-*
-*  This Program is free software; you can redistribute it and/or modify
-*  it under the terms of the GNU General Public License as published by
-*  the Free Software Foundation; either version 2, or (at your option)
-*  any later version.
-*
-*  This Program is distributed in the hope that it will be useful,
-*  but WITHOUT ANY WARRANTY; without even the implied warranty of
-*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-*  GNU General Public License for more details.
-*
-*  You should have received a copy of the GNU General Public License
-*  along with XBMC; see the file COPYING.  If not, write to
-*  the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
-*  http://www.gnu.org/copyleft/gpl.html
-*
-*/
+#ifndef PLAYLIST_HPP
+#define PLAYLIST_HPP
 
-#ifndef Playlist_hpp
-#define Playlist_hpp
-
-#include <stdio.h>
+#include <kodi/AddonBase.h>
+#include <chrono>
 #include <string>
 #include <map>
 #include <exception>
+#include <memory>
+#include <utility>
 
-namespace Buffers{
+namespace Buffers {
 
-typedef  float TimeOffset;
+using TimeOffset = float;
+using Timestamp = std::chrono::system_clock::time_point;
 
 struct SegmentInfo {
-    SegmentInfo () : startTime(0.0), duration(0.0) , index (-1){}
-    SegmentInfo(float t, float d, const std::string& u, uint64_t i) : startTime(t), url(u), duration(d), index(i){}
-    SegmentInfo(const SegmentInfo& info) : SegmentInfo(info.startTime, info.duration, info.url, info.index) {}
-    SegmentInfo&  operator=(const SegmentInfo&& s) { this->~SegmentInfo(); return *new (this)SegmentInfo(s.startTime, s.duration, s.url, s.index);}
-    SegmentInfo&  operator=(const SegmentInfo& s) { this->~SegmentInfo(); return *new (this)SegmentInfo(s.startTime, s.duration, s.url, s.index);}
-    const std::string url;
-    // Calculated from playlist's index offset
-    const TimeOffset startTime;
-    const float duration;
-    uint64_t index;
+    SegmentInfo() = default;
+    SegmentInfo(TimeOffset start, float dur, std::string url, uint64_t idx)
+        : startTime(start), duration(dur), url(std::move(url)), index(idx) {}
+
+    std::string url;
+    TimeOffset startTime = 0.0f;
+    float duration = 0.0f;
+    uint64_t index = 0;
+
+    SegmentInfo(SegmentInfo&&) noexcept = default;
+    SegmentInfo& operator=(SegmentInfo&&) noexcept = default;
 };
 
-class Playlist {
+class PlaylistException : public std::exception {
 public:
-    Playlist(const std::string &url, uint64_t indexOffset = 0);
-//    Playlist(const Playlist& playlist);
-    bool NextSegment(SegmentInfo& info, bool& hasMoreSegments);
-    bool SetNextSegmentIndex(uint64_t offset);
-    bool Reload();
-    bool IsVod() const {return m_isVod;}
-    int TargetDuration() const {return m_targetDuration;}
-    TimeOffset GetTimeOffset() const {return m_targetDuration * m_indexOffset;}
-private:
-    typedef std::map<uint64_t, SegmentInfo> TSegmentUrls;
+    explicit PlaylistException(std::string reason)
+        : m_reason(std::move(reason)) {}
     
-    bool ParsePlaylist(const std::string& data);
-    void SetBestPlaylist(const std::string& playlistUrl);
-    void LoadPlaylist(std::string& data) const;
-    
-    
-    TSegmentUrls m_segmentUrls;
-    std::string  m_playListUrl;
-    mutable std::string  m_effectivePlayListUrl;
-    uint64_t m_loadIterator;
-    bool m_isVod;
-    const uint64_t m_indexOffset;
-    uint64_t m_initialInternalIndex;
-    int m_targetDuration;
-    std::string m_httplHeaders;
-    
-};
+    const char* what() const noexcept override { 
+        return m_reason.c_str(); 
+    }
 
-class PlaylistException :  public std::exception
-{
-public:
-    PlaylistException(const char* reason = "")
-    : m_reason(reason)
-    {}
-    virtual const char* what() const noexcept {return m_reason.c_str();}
-    
 private:
     std::string m_reason;
 };
 
-}
+class Playlist {
+public:
+    explicit Playlist(const std::string& url, uint64_t indexOffset = 0);
+    
+    // Запрещаем копирование
+    Playlist(const Playlist&) = delete;
+    Playlist& operator=(const Playlist&) = delete;
+    
+    // Поддержка перемещения
+    Playlist(Playlist&&) noexcept = default;
+    Playlist& operator=(Playlist&&) noexcept = default;
 
-#endif /* Playlist_hpp */
+    bool NextSegment(SegmentInfo& info, bool& hasMoreSegments) noexcept;
+    bool SetNextSegmentIndex(uint64_t offset) noexcept;
+    bool Reload();
+    
+    bool IsVod() const noexcept { return m_isVod; }
+    int TargetDuration() const noexcept { return m_targetDuration; }
+    TimeOffset GetTimeOffset() const noexcept { 
+        return m_targetDuration * m_indexOffset; 
+    }
+
+private:
+    using SegmentMap = std::map<uint64_t, SegmentInfo>;
+    
+    void ParsePlaylist(const std::string& data);
+    void SetBestPlaylist(const std::string& playlistUrl);
+    void LoadPlaylist(std::string& data) const;
+
+    // Члены класса
+    SegmentMap m_segmentUrls;
+    std::string m_playListUrl;
+    mutable std::string m_effectivePlayListUrl;
+    std::string m_httpHeaders;
+    
+    uint64_t m_loadIterator = 0;
+    uint64_t m_indexOffset = 0;
+    int m_targetDuration = 0;
+    bool m_isVod = false;
+};
+
+} // namespace Buffers
+
+#endif // PLAYLIST_HPP
