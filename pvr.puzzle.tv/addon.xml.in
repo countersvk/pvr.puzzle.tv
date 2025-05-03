@@ -1,23 +1,33 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<addon id="pvr.puzzle.tv" version="1.0.0" name="PVR Puzzle TV" provider-name="srg70">
-    <requires>@ADDON_DEPENDS@</requires>
-  <extension
-    point="xbmc.pvrclient"
-    library_@PLATFORM@="@LIBRARY_FILENAME@"/>
-  <extension point="xbmc.addon.metadata">
-    <summary lang="en_US">Kodi PVR addon for IPTV support. Designed to agregate IPTV servise from different providers.</summary>
-    <summary lang="ru_RU">Kodi PVR аддон для поддержки IPTV. Позволяет интегрировать IPTV-услуги разных провайдеров</summary>
-    <description lang="en_US">Puzzle TV PVR Client supports streaming of Live TV, listening to Radio channels and EPG from service providers using dedicated API. Addon designed to be extandable.</description>
-    <description lang="ru_RU">Интерфейс для IPTV. Поддерживает просмотр потокового ТВ, прослушивание радиоканалов и работу с электронным телегидом от поствщиков услуг, используя специализированный интерфейс. Есть возможность расширения.</description>
-    <disclaimer lang="en_US">This is unstable software! The authors are in no way responsible for failed playings, incorrect EPG times, wasted hours, or any other undesirable effects.</disclaimer>
-    <disclaimer lang="ru_RU">Это нестабильная программа! Авторы не несут ответственности за неудачные воспроизведение, неверные время EPG, потраченное время и прочие нежелательные эффекты.</disclaimer>
-     <platform>@PLATFORM@</platform>
-     <forum>http://xbmc.ru/forum/showthread.php?t=14438</forum>
-     <source>https://github.com/srg70/pvr.puzzle.tv</source>
-     <license>GPL-2.0-or-later</license>
-     <news>
-         1.0.0
-         - First Matrix version (migration only)
-     </news>
-  </extension>
+<addon id="pvr.puzzle.tv" version="2.0.0" name="PVR Puzzle TV" provider-name="srg70">
+    <requires>
+        <import addon="xbmc.pvr" version="20.0.0"/>
+        <import addon="kodi.binary.global.main" version="20.0.0"/>
+    </requires>
+  
+    <extension
+        point="xbmc.pvrclient"
+        library_@PLATFORM@="@LIBRARY_FILENAME@"/>
+  
+    <extension point="xbmc.addon.metadata">
+        <summary lang="en_US">Kodi PVR addon for IPTV support. Designed to agregate IPTV service from different providers.</summary>
+        <summary lang="ru_RU">Kodi PVR аддон для поддержки IPTV. Позволяет интегрировать IPTV-услуги разных провайдеров</summary>
+        
+        <description lang="en_US">Puzzle TV PVR Client supports streaming of Live TV, listening to Radio channels and EPG from service providers using dedicated API. Addon designed to be extendable.</description>
+        <description lang="ru_RU">Интерфейс для IPTV. Поддерживает просмотр потокового ТВ, прослушивание радиоканалов и работу с электронным телегидом от поставщиков услуг, используя специализированный интерфейс. Есть возможность расширения.</description>
+        
+        <disclaimer lang="en_US">This is unstable software! The authors are in no way responsible for failed playings, incorrect EPG times, wasted hours, or any other undesirable effects.</disclaimer>
+        <disclaimer lang="ru_RU">Это нестабильная программа! Авторы не несут ответственности за неудачные воспроизведение, неверные время EPG, потраченное время и прочие нежелательные эффекты.</disclaimer>
+        
+        <platform>@PLATFORM@</platform>
+        <forum>http://xbmc.ru/forum/showthread.php?t=14438</forum>
+        <source>https://github.com/srg70/pvr.puzzle.tv</source>
+        <license>GPL-2.0-or-later</license>
+        
+        <news>
+            2.0.0
+            - Kodi 20+ compatibility
+            - Updated PVR API
+        </news>
+    </extension>
 </addon>
