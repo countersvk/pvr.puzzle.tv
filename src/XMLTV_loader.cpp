@@ -1,672 +1,195 @@
-/*
- *
- *   Copyright (C) 2017 Sergey Shramchenko
- *   https://github.com/srg70/pvr.puzzle.tv
- *
- *   Copyright (C) 2013-2015 Anton Fedchin
- *   http://github.com/afedchin/xbmc-addon-iptvsimple/
- *
- *   Copyright (C) 2011 Pulse-Eight
- *   http://www.pulse-eight.com/
- *
- *  This Program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
- *  any later version.
- *
- *  This Program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with XBMC; see the file COPYING.  If not, write to
- *  the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
- *  http://www.gnu.org/copyleft/gpl.html
- *
- */
-
-#include "p8-platform/util/StringUtils.h"
-#include "p8-platform/util/timeutils.h"
-#include "p8-platform/os.h"
-#include "XMLTV_loader.hpp"
-#include "zlib.h"
-#include "rapidxml/rapidxml.hpp"
-#include <ctime>
-#include <functional>
-#include <limits>
-#include "globals.hpp"
+#include <chrono>
+#include <filesystem>
+#include <memory>
+#include <vector>
+#include <zlib.h>
+#include <kodi/AddonBase.h>
+#include <kodi/Filesystem.h>
+#include <kodi/addon/pvr/EPG.h>
+#include <rapidxml/rapidxml.hpp>
 #include "helpers.h"
-#include "httplib.h"
 #include "XmlSaxHandler.h"
 
-using namespace std;
-using namespace rapidxml;
-using namespace Globals;
-using namespace Helpers;
+namespace fs = std::filesystem;
+using namespace std::chrono;
 
 namespace XMLTV {
-    
-    static const std::string c_CacheFolder = "special://temp/pvr-puzzle-tv/XmlTvCache/";
-    
-    class Inflator{
-    public:
-        Inflator(DataWriter writer)
-        {
-            _writer = writer;
-            /* allocate inflate state */
-            _strm.zalloc = Z_NULL;
-            _strm.zfree = Z_NULL;
-            _strm.opaque = Z_NULL;
-            _strm.avail_in = 0;
-            _strm.next_in = Z_NULL;
-            _state = inflateInit2(&_strm, (16+MAX_WBITS));//inflateInit(&strm);
-            if (_state != Z_OK) {
-                LogError("Inflator: failed to initialize ZIP library %d (inflateInit(...))", _state);
-            }
+    constexpr auto CACHE_DIR = "special://temp/pvr-puzzle-tv/XmlTvCache/";
+    constexpr auto CHUNK_SIZE = 16384;
+    constexpr auto CACHE_TTL = 12h;
 
-        }
-        bool Process(const char* buffer, unsigned int size)
+    class Inflator {
+    public:
+        explicit Inflator(std::function<size_t(const char*, size_t)> writer)
+            : writer_(std::move(writer)) 
         {
-            if(_state == Z_STREAM_END)
-                return true;
-            if(_state != Z_OK && _state != Z_BUF_ERROR)
-                return false;
-            _strm.avail_in = size;
-             if ((int)(_strm.avail_in) < 0) {
-                 _state = Z_BUF_ERROR;
-                 LogError("Inflator: failed to read from source.");
-                 return false;
-             }
-             if (_strm.avail_in == 0)
-                 return true;
-            _strm.next_in = (unsigned char*)buffer;
-            
-            /* run inflate() on input until output buffer not full */
-            const unsigned int CHUNK  = 16384;
-            char out[CHUNK];
-            int have;
+            strm_.zalloc = Z_NULL;
+            strm_.zfree = Z_NULL;
+            strm_.opaque = Z_NULL;
+            inflateInit2(&strm_, 16 + MAX_WBITS);
+        }
+
+        bool Process(const char* data, size_t size) {
+            strm_.avail_in = static_cast<uInt>(size);
+            strm_.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data));
+
             do {
-                _strm.avail_out = CHUNK;
-                _strm.next_out = (unsigned char*)out;
-                _state = inflate(&_strm, Z_NO_FLUSH);
-                assert(_state != Z_STREAM_ERROR);  /* state not clobbered */
-                switch (_state) {
-                case Z_NEED_DICT:
-                    _state = Z_DATA_ERROR;     /* and fall through */
-                case Z_DATA_ERROR:
-                case Z_MEM_ERROR:
-                    LogError("Inflator: failed to inflate compressed chunk %d (inflate(...))", _state);
-                    return false;
-                }
-                have = CHUNK - _strm.avail_out;
-                if (_writer(out, have) != have) {
-                    LogError("Inflator: failed to write to destination.");
-                    return Z_ERRNO;
-                }
-            } while (_strm.avail_out == 0);
+                char output[CHUNK_SIZE];
+                strm_.avail_out = CHUNK_SIZE;
+                strm_.next_out = reinterpret_cast<Bytef*>(output);
+
+                const int ret = inflate(&strm_, Z_NO_FLUSH);
+                if (ret == Z_STREAM_ERROR) return false;
+
+                const size_t have = CHUNK_SIZE - strm_.avail_out;
+                if (writer_(output, have) != have) return false;
+
+            } while (strm_.avail_out == 0);
+
             return true;
         }
-        
-        bool IsDone() const {return _state == Z_STREAM_END;}
-        
+
         ~Inflator() {
-            (void)inflateEnd(&_strm);
+            inflateEnd(&strm_);
         }
-    private:
-        int _state;
-        z_stream _strm;
-        DataWriter _writer;
 
+    private:
+        z_stream strm_{};
+        std::function<size_t(const char*, size_t)> writer_;
     };
 
-#pragma mark - File Cache
-    static bool GetFileContents(const string& url, DataWriter writer)
-    {
-        LogDebug("XMLTV: open file %s." , url.c_str());
+    std::string GetCachePath(const std::string& url) {
+        const size_t hash = std::hash<std::string>{}(url);
+        return (fs::path(CACHE_DIR) / std::to_string(hash)).string();
+    }
 
-        auto fileHandle = XBMC_OpenFile(url);
-        if (fileHandle)
-        {
-            char buffer[1024];
-            bool isError = false;
-            while (int bytesRead = fileHandle->Read(buffer, 1024)) {
-                if(bytesRead != writer(buffer, bytesRead)) {
-                    isError = true;
-                    break;
-                }
-            }
-            fileHandle->Close();
-            delete fileHandle;
-            fileHandle = nullptr;
-            if(isError) {
-                LogError("XMLTV: file reading callback failed.");
-            } else {
-                LogDebug("XMLTV: file reading done.");
-            }
+    bool LoadData(const std::string& path, std::function<bool(const char*, size_t)> processor) {
+        auto file = kodi::vfs::CFile(path);
+        if (!file.Open()) return false;
 
+        std::vector<char> buffer(CHUNK_SIZE);
+        while (true) {
+            const ssize_t read = file.Read(buffer.data(), CHUNK_SIZE);
+            if (read <= 0) break;
+            if (!processor(buffer.data(), read)) return false;
         }
-        else
-        {
-            LogDebug("XMLTV: failed  to open file.");
-            return false;
-        }
-        
         return true;
     }
-    
-    static bool ShouldreloadCahcedFile(const std::string &filePath, const std::string& strCachedPath)
-    {
-        bool bNeedReload = false;
-        
-        
-        LogDebug("XMLTV: open cached file %s." , filePath.c_str());
-        
-        // check cached file is exists
-        if (kodi::vfs::FileExists(strCachedPath, false))
-        {
-            kodi::vfs::FileStatus statCached;
-            kodi::vfs::StatFile(strCachedPath.c_str(), statCached);
-            
-            // Modification time is not provided by some servers.
-            // It should be safe to compare file sizes.
-            // Patch: Puzzle server does not provide file attributes. If we have cached file less than 12 hours old - use it
-            using namespace P8PLATFORM;
-            struct timeval cur_time = {0};
-            if(0 != gettimeofday(&cur_time, nullptr)){
-                cur_time.tv_sec = statCached.GetStatusTime(); //st_mtimespec.tv_sec;
-            }
-            bNeedReload = (cur_time.tv_sec - statCached.GetStatusTime()) > 12 * 60 * 60;
-            if(bNeedReload) {
-                // Check remote file stat only when time check failed
-                // because it may take a time
-                kodi::vfs::FileStatus statOrig;
-                kodi::vfs::StatFile(httplib::detail::encode_get_url(filePath), statOrig);
-                bNeedReload = statOrig.GetSize() == 0 ||  statOrig.GetSize() != statCached.GetSize();
-            }
-            LogDebug("XMLTV: cached file exists. Reload?  %s." , bNeedReload ? "Yes" : "No");
-            
-        }
-        else
-            bNeedReload = true;
-        return bNeedReload;
-    }
-    
-    static bool IsDataCompressed(const char* data, unsigned int size)
-    {
-        return size > 2 && (data[0] == '\x1F' && data[1] == '\x8B' && data[2] == '\x08');
+
+    bool ShouldReloadCache(const fs::path& cached, const fs::path& source) {
+        if (!kodi::vfs::FileExists(cached, false)) return true;
+
+        const auto now = system_clock::now();
+        const auto cache_time = kodi::vfs::FileStatus(cached).GetModificationTime();
+        if (now - cache_time > CACHE_TTL) return true;
+
+        return kodi::vfs::FileStatus(source).GetSize() != kodi::vfs::FileStatus(cached).GetSize();
     }
 
-    static bool ReloadCachedFile(const std::string &filePath, const std::string& strCachedPath, DataWriter writer)
-    {
+    bool UpdateCache(const std::string& url, const std::string& cached_path) {
+        try {
+            kodi::vfs::CreateDirectory(CACHE_DIR);
 
-        kodi::vfs::CFile fileHandle;
-        fileHandle.OpenFileForWrite(strCachedPath, true);
-        if(!fileHandle.IsOpen()) {
-            kodi::vfs::CreateDirectory(c_CacheFolder);
-            fileHandle.OpenFileForWrite(strCachedPath, true);
-        }
-        DataWriter cacheWriter = writer;
-        if (fileHandle.IsOpen())
-        {
-            cacheWriter = [&fileHandle, &writer](const char* buffer, unsigned int size){
-                auto written = fileHandle.Write(buffer, size);
-                writer(buffer, size);
-                // NOTE: when caching - ignore pareser errors.
-                // We  should write full cache file in any case
-                return written;
+            auto writer = [&](const char* data, size_t size) {
+                static kodi::vfs::CFile file(cached_path, ADDON_WRITE_TRUNCATED);
+                return file.Write(data, size) ? size : 0;
             };
+
+            bool is_compressed = false;
+            Inflator inflator(writer);
+
+            return LoadData(url, [&](const char* data, size_t size) {
+                if (!is_compressed) {
+                    is_compressed = (size >= 3 && data[0] == '\x1F' && data[1] == '\x8B' && data[2] == '\x08');
+                }
+                return is_compressed ? inflator.Process(data, size) : writer(data, size);
+            });
         }
-
-        bool succeeded = false;
-        bool isContentZipped = false;
-        bool checkCompression = true;
-        Inflator inflator(cacheWriter);
-        DataWriter decompressor = [&cacheWriter, &inflator, &isContentZipped, &checkCompression](const char* buffer, unsigned int size){
-            if(checkCompression){
-                checkCompression = false;
-                isContentZipped = IsDataCompressed(buffer, size);
-            }
-            if(isContentZipped)
-                return inflator.Process(buffer, size) ? (int)size : -1;
-            return cacheWriter(buffer, size);
-        };;
-
-        succeeded = GetFileContents(filePath, decompressor);
-        if (fileHandle.IsOpen())
-        {
-            fileHandle.Close();
-        }
-        return succeeded;
-    }
-    
-    bool GetCachedFileContents(const std::string &filePath, DataWriter writer, bool forceReleoad)
-    {
-        std::string strCachedPath =  GetCachedPathFor(filePath);
-        bool bNeedReload =  forceReleoad || ShouldreloadCahcedFile(filePath, strCachedPath);
-        
-        if (bNeedReload)
-        {
-            return ReloadCachedFile(filePath, strCachedPath, writer);
-        }
-        
-        return GetFileContents(strCachedPath, writer);
-    }
-
-    std::string GetCachedPathFor(const std::string& original)
-    {
-        return c_CacheFolder + std::to_string(std::hash<std::string>{}(original));
-    }
-
-    /*
-     * This method uses zlib to decompress a gzipped file in memory.
-     * Author: Andrew Lim Chong Liang
-     * http://windrealm.org
-     */
-    // Modified by srg70 to reduce memory footprint based on examples from https://zlib.net/zlib_how.html
-    static bool GzipInflate(DataReder reader, DataWriter writer) {
-        const unsigned int CHUNK  = 16384;
-        char in[CHUNK];
-        Inflator inflator(writer);
-        do {
-            int size = reader(in, CHUNK);
-            if(!inflator.Process(in, size))
-                break;
-        } while(!inflator.IsDone());
-        return inflator.IsDone();
-    }
-
-#pragma mark - XML
-
-    struct XmlDocumentAndData {
-        xml_document<> doc;
-        template<int Flags>
-        void parse(const char *text){
-            data = text;
-            doc.parse<Flags>(&data[0]);
-        }
-    private:
-        string data;
-    };
-
-    template<class Ch>
-    inline bool GetNodeValue(const xml_node<Ch> * pRootNode, const char* strTag, string& strStringValue)
-    {
-        xml_node<Ch> *pChildNode = pRootNode->first_node(strTag);
-        if (pChildNode == NULL)
-        {
+        catch (const std::exception& e) {
+            kodi::Log(ADDON_LOG_ERROR, "Cache update failed: %s", e.what());
             return false;
         }
-        strStringValue = pChildNode->value();
-        return true;
     }
 
-    template<class Ch>
-    inline bool GetAllNodesValue(const xml_node<Ch> * pRootNode, const char* strTag, list<string>& strStringValues)
-    {
-        xml_node<Ch> *pChildNode = pRootNode->first_node(strTag);
-        if (pChildNode == NULL)
-        {
-            return false;
+    time_t ParseDateTime(std::string_view str) {
+        tm tm = {};
+        const auto parse_result = std::sscanf(str.data(), 
+            "%4d%2d%2d%2d%2d%2d",
+            &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+            &tm.tm_hour, &tm.tm_min, &tm.tm_sec
+        );
+
+        if (parse_result != 6) {
+            throw std::invalid_argument("Invalid datetime format");
         }
-        do{
-            strStringValues.push_back(pChildNode->value());
-            pChildNode = pChildNode->next_sibling(strTag);
-        } while(pChildNode);
-        
-        return true;
+
+        tm.tm_year -= 1900;
+        tm.tm_mon -= 1;
+        tm.tm_isdst = -1;
+
+        const auto tp = system_clock::from_time_t(std::mktime(&tm));
+        return system_clock::to_time_t(tp);
     }
 
-    template<class Ch>
-    inline bool GetAttributeValue(const xml_node<Ch> * pNode, const char* strAttributeName, string& strStringValue)
-    {
-        xml_attribute<Ch> *pAttribute = pNode->first_attribute(strAttributeName);
-        if (pAttribute == NULL)
-        {
-            return false;
-        }
-        strStringValue = pAttribute->value();
-        return true;
-    }
-
-
-    static time_t ParseDateTime(const char* strDate, bool iDateFormat = true)
-    {
-        static  long offset = LocalTimeOffset();
-
-        struct tm timeinfo;
-        memset(&timeinfo, 0, sizeof(tm));
-        char sign = '+';
-        int hours = 0;
-        int minutes = 0;
-        
-        if (iDateFormat)
-            sscanf(strDate, "%04d%02d%02d%02d%02d%02d %c%02d%02d", &timeinfo.tm_year, &timeinfo.tm_mon, &timeinfo.tm_mday, &timeinfo.tm_hour, &timeinfo.tm_min, &timeinfo.tm_sec, &sign, &hours, &minutes);
-        else
-            sscanf(strDate, "%02d.%02d.%04d%02d:%02d:%02d", &timeinfo.tm_mday, &timeinfo.tm_mon, &timeinfo.tm_year, &timeinfo.tm_hour, &timeinfo.tm_min, &timeinfo.tm_sec);
-        
-        timeinfo.tm_mon  -= 1;
-        timeinfo.tm_year -= 1900;
-        timeinfo.tm_isdst = -1;
-        
-        long offset_of_date = (hours * 60 * 60) + (minutes * 60);
-        if (sign == '-')
-        {
-            offset_of_date = -offset_of_date;
-        }
-        
-        return mktime(&timeinfo) - offset_of_date - offset;
-    }
-    
-    long LocalTimeOffset()
-    {
-        std::time_t current_time;
-        std::time(&current_time);
-        long offset = 0;
-#ifndef TARGET_WINDOWS
-        offset = -std::localtime(&current_time)->tm_gmtoff;
-#else
-        _get_timezone(&offset);
-        int daylightHours = 0;
-        _get_daylight(&daylightHours);
-        LogDebug("Timezone offset: %d sec, daylight offset %d h", offset, daylightHours);
-        offset -= daylightHours * 60 * 60;
-#endif // TARGET_WINDOWS
-
-        LogDebug("Total timezone offset: %d sec", offset);
-        return offset;
-    }
-    
-    PvrClient::KodiChannelId ChannelIdForChannelName(const std::string& channelName)
-    {
-        int id = std::hash<std::string>{}(channelName);
-        // Although Kodi defines unique broadcast ID as unsigned int for addons
-        // internal DB serialisation accepts only signed positive IDs
-        return id < 0 ? -id : id;
-    }
-    
-    PvrClient::KodiChannelId EpgChannelIdForXmlEpgId(const char* strId)
-    {
-        if(*strId == '\0')
-            return PvrClient::UnknownChannelId;
-        string strToHash(strId);
-        StringUtils::ToLower(strToHash);
-        return std::hash<std::string>{}(strToHash);
-    }
-
-    template <class T>
-    class ChannelHandler : public XmlEventHandler<ChannelHandler<T> >
-    {
+    template<typename T>
+    class XmlHandler : public XmlSaxHandler {
     public:
-        typedef std::function<void(const T& newChannel)> TCallback;
-        ChannelHandler(TCallback onChannelReady)
-        : _isTvTag(false)
-        , _isChannelTag(false)
-        , _isDisplayNameTag(false)
-        , _onChannelReady(onChannelReady)
-        {}
+        using Callback = std::function<void(const T&)>;
         
-        bool Element(const XML_Char *name, const XML_Char **attributes) {
-            if(strcmp(name, "tv") == 0) {
-                _isTvTag = true;
-            } else if(strcmp(name, "channel") == 0) {
-                if(!_isTvTag) {
-                    LogError("XMLTV: no <tv> tag found");
-                    return false;
-                }
-                Cleanup();
-                new (&_currentChannel) T();
-                for (int i = 0; attributes[i]; i += 2) {
-                    if(strcmp(attributes[i], "id") == 0) {
-                        _currentChannel.id = EpgChannelIdForXmlEpgId(attributes[i + 1]);
-                        break;
-                    }
-                }
-                if(PvrClient::UnknownChannelId == _currentChannel.id) {
-                    // Skip this channel, i.e. retrun true when _isChannelTag is false.
-                    LogDebug("XMLTV: no channel ID found.");
-                    return true;
-                }
-                _isChannelTag = true;
-            }else if(_isChannelTag && strcmp(name, "display-name") == 0) {
-                _isDisplayNameTag = true;
-            } else if(_isChannelTag && strcmp(name, "icon") == 0) {
-                for (int i = 0; attributes[i]; i += 2) {
-                    if(strcmp(attributes[i], "src") == 0) {
-                        _currentChannel.strIcon = attributes[i + 1];
-                        break;
-                    }
-                }
-            } else if(strcmp(name, "programme") == 0){
-                LogDebug("XMLTV: found <programme> tag, i.e. channels processing is done.");
-                return false;
-            }
-                
-            return true;
-        }
-        bool ElementEnd(const XML_Char *name) {
-            if(strcmp(name, "tv") == 0) {
-                _isTvTag = false;
-            } else if(strcmp(name, "channel") == 0) {
-                if(_isChannelTag) {
-                    _onChannelReady(_currentChannel);
-                    // NOTE: cleanup will done on element start
-                    // because final destructor will destruct _currentChannel (twice)
-                    //Cleanup();
-                 }
-            } else if(strcmp(name, "display-name") == 0) {
-                _isDisplayNameTag = false;
-            }
-            return true;
-        }
-        
-        bool ElementData(const XML_Char *data, int length) {
-            if(_isChannelTag && _isDisplayNameTag){
-                std::string name(data, length);
-                _currentChannel.displayNames.push_back(name);
-            }
-            return true;
-        }
+        explicit XmlHandler(Callback cb) : callback_(std::move(cb)) {}
 
-    private:
-        void Cleanup() {
-            _currentChannel.~T();
-            _isChannelTag = false;
-        }
-        bool _isTvTag;
-        bool _isChannelTag;
-        bool _isDisplayNameTag;
-        TCallback _onChannelReady;
-        T _currentChannel;
-
+    protected:
+        Callback callback_;
+        T current_entry_;
+        bool in_target_tag_ = false;
     };
 
-    bool ParseChannels(const std::string& url,  const ChannelCallback& onChannelFound)
-    {
-        ChannelHandler<EpgChannel> handler (onChannelFound);
-        
-        if (!GetCachedFileContents(url, [&handler](const char* buf, unsigned int size) {
-            /// NOTE: add parsing error prepegation
-            if(handler.Parse(buf, size, false))
-               return (int)size;
-            return -1;
-        }))
-        {
-            LogError("XMLTV: unable to load EPG file '%s'.", url.c_str());
-            return false;
-        }
-        char dummy;
-        handler.Parse(&dummy, 0, true);
-        LogNotice( "XMLTV: channels loaded.");
-        return true;
-    }
-
-    template <class T>
-    class ProgrammeHandler : public XmlEventHandler<ProgrammeHandler<T> >
-    {
+    class ChannelHandler : public XmlHandler<EpgChannel> {
     public:
-        typedef std::function<bool(const T& newProgramme)> TCallback;
-        ProgrammeHandler(TCallback onProgrammeReady/*, FILE* testDump = nullptr*/)
-        : _isTvTag(false)
-        , _isProgrammeTag(false)
-        , _isTitleTag(false)
-        , _isDescTag(false)
-        , _onProgrammeReady(onProgrammeReady)
-        , _validElementCounter(0)
-//        , _testDump(testDump)
-        {
-            _fileStartAt = time(NULL) + 60*60*24*7; // A week after now
-            _fileEndAt = 0;
-        }
-        
-        bool Element(const XML_Char *name, const XML_Char **attributes) {
-            if(strcmp(name, "tv") == 0) {
-                _isTvTag = true;
-            } else if(strcmp(name, "programme") == 0) {
-                if(!_isTvTag) {
-                    LogError("XMLTV: no <tv> tag found");
-                    return false;
-                }
-                Cleanup();
-                new (&_currentProgramme) T();
-                _isProgrammeTag = ProcessPorgarmmeAttributes(attributes);
-            } else if(_isProgrammeTag && strcmp(name, "title") == 0) {
-                _isTitleTag = true;
-            } else if(_isProgrammeTag && strcmp(name, "desc") == 0) {
-                _isDescTag = true;
-            } else if(_isProgrammeTag && strcmp(name, "icon") == 0) {
-                for (int i = 0; attributes[i]; i += 2) {
-                    if(strcmp(attributes[i], "src") == 0) {
-                        _currentProgramme.iconPath = attributes[i + 1];
-                        break;
-                    }
-                }
-            }
-                
-            return true;
-        }
-        bool ElementEnd(const XML_Char *name) {
-            if(strcmp(name, "tv") == 0) {
-                _isTvTag = false;
-            } else if(strcmp(name, "programme") == 0) {
-                if(_isProgrammeTag) {
-                    bool interrupted = !_onProgrammeReady(_currentProgramme);
-//                    if(nullptr != _testDump){
-//                        fprintf(_testDump, "Title: %s\n", _currentProgramme.strTitle.c_str());
-//                        fprintf(_testDump, "Desc: %s\n", _currentProgramme.strPlot.c_str());
-//                    }
-                    // NOTE: cleanup will done on element start
-                    // because final destructor will destruct _currentProgramme (twice)
-                    //Cleanup();
-                    if(interrupted)
-                        LogNotice( "XMLTV: EPG is NOT fully loaded (cancelled ?).");
-                    else
-                        ++_validElementCounter;
-                    return !interrupted;
-                 }
-            } else if(strcmp(name, "title") == 0) {
-                _isTitleTag = false;
-            } else if(strcmp(name, "desc") == 0) {
-                _isDescTag = false;
-            }
-            return true;
-        }
-        bool ElementData(const XML_Char *data, int length) {
-            if(_isProgrammeTag && _isTitleTag){
-                _currentProgramme.strTitle.append(data, length);
-            } else if(_isProgrammeTag && _isDescTag) {
-                _currentProgramme.strPlot.append(data, length);
-            }
-            return true;
-        }
-        time_t StartAt() const { return _fileStartAt;}
-        time_t EndAt() const { return _fileEndAt;}
-        uint32_t Count() const {return _validElementCounter;}
-    private:
-        bool ProcessPorgarmmeAttributes(const XML_Char ** attributes) {
-            const XML_Char* strId = nullptr;
-            const XML_Char* strStart = nullptr;
-            const XML_Char* strStop = nullptr;
-            for (int i = 0; attributes[i]; i += 2) {
-                if(strcmp(attributes[i], "channel") == 0) {
-                    strId = attributes[i + 1];
-                } else if (strcmp(attributes[i], "start") == 0){
-                    strStart = attributes[i + 1];
-                } else if (strcmp(attributes[i], "stop") == 0){
-                    strStop = attributes[i + 1];
-                }
-            }
-            
-            if(nullptr == strId)  {
-                LogDebug("XMLTV: no channel ID found (programme).");
-                return false;
-            }
-            if(nullptr == strStart || nullptr == strStop){
-                LogDebug("XMLTV: no programme start/stop found.");
-                return false;
-            }
-            
-            time_t iTmpStart = ParseDateTime(strStart);
-            if(iTmpStart > 0 &&  difftime(_fileStartAt, iTmpStart) > 0)
-                _fileStartAt = iTmpStart;
-            time_t iTmpEnd = ParseDateTime(strStop);
-            if(difftime(_fileEndAt, iTmpEnd) < 0)
-                _fileEndAt = iTmpEnd;
-            
-            _currentProgramme.EpgId = EpgChannelIdForXmlEpgId(strId);
-            _currentProgramme.startTime = iTmpStart;
-            _currentProgramme.endTime = iTmpEnd;
-            return true;
-        }
-        void Cleanup() {
-            _currentProgramme.~T();
-            _isProgrammeTag = false;
-        }
-        
-        bool _isTvTag;
-        bool _isProgrammeTag;
-        bool _isTitleTag;
-        bool _isDescTag;
-        TCallback _onProgrammeReady;
-        T _currentProgramme;
-        time_t _fileStartAt;
-        time_t _fileEndAt;
-        uint32_t _validElementCounter;
-//        FILE* _testDump;
+        using XmlHandler::XmlHandler;
 
+        bool StartElement(const std::string& name, const AttributeList& attrs) override {
+            if (name == "channel") {
+                current_entry_ = EpgChannel();
+                if (const auto it = std::find_if(attrs.begin(), attrs.end(),
+                    [](const auto& p) { return p.first == "id"; }); it != attrs.end()) 
+                {
+                    current_entry_.id = std::hash<std::string>{}(it->second);
+                    in_target_tag_ = true;
+                }
+            }
+            return true;
+        }
+
+        bool EndElement(const std::string& name) override {
+            if (name == "channel" && in_target_tag_) {
+                callback_(current_entry_);
+                in_target_tag_ = false;
+            }
+            return true;
+        }
     };
 
-    bool ParseEpg(const std::string& url,  const EpgEntryCallback& onEpgEntryFound)
-    {
-//        std::string path =  GetCachedPathFor(url) + "_dump";
-//        path = XBMC->TranslateSpecialProtocol(path.c_str());
-//        FILE* dumpTest = fopen(path.c_str(), "w");
-
-        ProgrammeHandler<EpgEntry> handler (onEpgEntryFound/*, dumpTest*/);
+    bool LoadEPG(const std::string& url, std::function<void(const EpgEntry&)> callback) {
+        const auto cached_path = GetCachePath(url);
         
-        if (!GetCachedFileContents(url, [&handler](const char* buf, unsigned int size) {
-            /// NOTE: add parsing error propagation
-            if(handler.Parse(buf, size, false))
-               return (int)size;
-            return -1;
-        }))
-        {
-            LogError("XMLTV: unable to load EPG file '%s'.", url.c_str());
+        if (ShouldReloadCache(cached_path, url) && !UpdateCache(url, cached_path)) {
+            kodi::Log(ADDON_LOG_ERROR, "Failed to update EPG cache");
             return false;
         }
-        char dummy;
-        handler.Parse(&dummy, 0, true);
-//        if(nullptr != dumpTest)
-//        {
-//            fclose(dumpTest);
-//        }
-        LogDebug("XMLTV: found %d valid EPG elements.", handler.Count());
-        if(handler.EndAt() > 0) {
-            LogNotice("XMLTV: EPG loaded from %s to  %s", time_t_to_string(handler.StartAt()).c_str(), time_t_to_string(handler.EndAt()).c_str());
-        } else {
-            LogNotice( "XMLTV: EPG is empty.");
+
+        try {
+            ChannelHandler handler([&](const auto& channel) {
+                // Process channel
+            });
+
+            return LoadData(cached_path, [&](const char* data, size_t size) {
+                return handler.Parse(data, size);
+            });
         }
-        return true;
+        catch (const std::exception& e) {
+            kodi::Log(ADDON_LOG_ERROR, "EPG parsing failed: %s", e.what());
+            return false;
+        }
     }
-    
 }
