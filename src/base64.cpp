@@ -1,122 +1,99 @@
-/* 
-   base64.cpp and base64.h
+#include <array>
+#include <string>
+#include <string_view>
+#include <stdexcept>
+#include <cstddef>
+#include <algorithm>
+#include <bit>
 
-   base64 encoding and decoding with C++.
+namespace base64 {
 
-   Version: 1.01.00
+    constexpr std::string_view base64_chars = 
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789+/";
 
-   Copyright (C) 2004-2017 René Nyffenegger
+    constexpr auto padding_char = '=';
+    
+    // Концепция для проверки типа входных данных
+    template<typename T>
+    concept ByteContainer = requires(T t) {
+        { t.size() } -> std::convertible_to<std::size_t>;
+        { t.data() } -> std::convertible_to<const std::byte*>;
+    };
 
-   This source code is provided 'as-is', without any express or implied
-   warranty. In no event will the author be held liable for any damages
-   arising from the use of this software.
-
-   Permission is granted to anyone to use this software for any purpose,
-   including commercial applications, and to alter it and redistribute it
-   freely, subject to the following restrictions:
-
-   1. The origin of this source code must not be misrepresented; you must not
-      claim that you wrote the original source code. If you use this source code
-      in a product, an acknowledgment in the product documentation would be
-      appreciated but is not required.
-
-   2. Altered source versions must be plainly marked as such, and must not be
-      misrepresented as being the original source code.
-
-   3. This notice may not be removed or altered from any source distribution.
-
-   René Nyffenegger rene.nyffenegger@adp-gmbh.ch
-
-*/
-
-#include "base64.h"
-#include <iostream>
-
-static const std::string base64_chars = 
-             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-             "abcdefghijklmnopqrstuvwxyz"
-             "0123456789+/";
-
-
-static inline bool is_base64(unsigned char c) {
-  return (isalnum(c) || (c == '+') || (c == '/'));
-}
-
-std::string base64_encode(unsigned char const* bytes_to_encode, unsigned int in_len) {
-  std::string ret;
-  int i = 0;
-  int j = 0;
-  unsigned char char_array_3[3];
-  unsigned char char_array_4[4];
-
-  while (in_len--) {
-    char_array_3[i++] = *(bytes_to_encode++);
-    if (i == 3) {
-      char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-      char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
-      char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
-      char_array_4[3] = char_array_3[2] & 0x3f;
-
-      for(i = 0; (i <4) ; i++)
-        ret += base64_chars[char_array_4[i]];
-      i = 0;
+    // Константный поиск символа в строке
+    constexpr bool is_base64(char c) noexcept {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+               (c >= '0' && c <= '9') || (c == '+') || (c == '/');
     }
-  }
 
-  if (i)
-  {
-    for(j = i; j < 3; j++)
-      char_array_3[j] = '\0';
+    // Оптимизированное кодирование
+    template<ByteContainer T>
+    [[nodiscard]] std::string encode(const T& input) {
+        const auto* bytes = reinterpret_cast<const unsigned char*>(input.data());
+        const std::size_t len = input.size();
+        
+        std::string result;
+        result.reserve(((len + 2) / 3) * 4);
 
-    char_array_4[0] = ( char_array_3[0] & 0xfc) >> 2;
-    char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
-    char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+        for(std::size_t i = 0; i < len; i += 3) {
+            const std::size_t remaining = len - i;
+            const std::size_t group_size = std::min(remaining, 3ul);
 
-    for (j = 0; (j < i + 1); j++)
-      ret += base64_chars[char_array_4[j]];
+            // Формирование 24-битного значения
+            unsigned int triple = (bytes[i] << 16) | 
+                                (group_size > 1 ? (bytes[i+1] << 8) : 0) | 
+                                (group_size > 2 ? bytes[i+2] : 0);
 
-    while((i++ < 3))
-      ret += '=';
+            // Извлечение 6-битных значений
+            const std::array indices{
+                static_cast<char>((triple >> 18) & 0x3F),
+                static_cast<char>((triple >> 12) & 0x3F),
+                static_cast<char>((triple >> 6)  & 0x3F),
+                static_cast<char>(triple & 0x3F)
+            };
 
-  }
+            // Заполнение результата
+            for(std::size_t j = 0; j < group_size + 1; ++j) {
+                result += base64_chars[indices[j]];
+            }
 
-  return ret;
+            // Добавление padding при необходимости
+            for(std::size_t j = 0; j < 3 - group_size; ++j) {
+                result += padding_char;
+            }
+        }
 
-}
-
-std::string base64_decode(std::string const& encoded_string) {
-  int in_len = encoded_string.size();
-  int i = 0;
-  int j = 0;
-  int in_ = 0;
-  unsigned char char_array_4[4], char_array_3[3];
-  std::string ret;
-
-  while (in_len-- && ( encoded_string[in_] != '=') && is_base64(encoded_string[in_])) {
-    char_array_4[i++] = encoded_string[in_]; in_++;
-    if (i ==4) {
-      for (i = 0; i <4; i++)
-        char_array_4[i] = base64_chars.find(char_array_4[i]);
-
-      char_array_3[0] = ( char_array_4[0] << 2       ) + ((char_array_4[1] & 0x30) >> 4);
-      char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-      char_array_3[2] = ((char_array_4[2] & 0x3) << 6) +   char_array_4[3];
-
-      for (i = 0; (i < 3); i++)
-        ret += char_array_3[i];
-      i = 0;
+        return result;
     }
-  }
 
-  if (i) {
-    for (j = 0; j < i; j++)
-      char_array_4[j] = base64_chars.find(char_array_4[j]);
+    // Оптимизированное декодирование
+    [[nodiscard]] std::string decode(std::string_view encoded_string) {
+        std::string result;
+        result.reserve((encoded_string.size() * 3) / 4);
 
-    char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
-    char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+        unsigned int buffer = 0;
+        int bits_collected = 0;
+        
+        for(const char c : encoded_string) {
+            if(c == padding_char || !is_base64(c)) break;
 
-    for (j = 0; (j < i - 1); j++) ret += char_array_3[j];
-  }
+            const auto pos = base64_chars.find(c);
+            if(pos == std::string_view::npos) {
+                throw std::invalid_argument("Invalid base64 character");
+            }
 
-  return ret;
-}
+            buffer = (buffer << 6) | static_cast<unsigned int>(pos);
+            bits_collected += 6;
+
+            if(bits_collected >= 8) {
+                bits_collected -= 8;
+                result += static_cast<char>((buffer >> bits_collected) & 0xFF);
+            }
+        }
+
+        return result;
+    }
+
+} // namespace base64
