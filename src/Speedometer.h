@@ -1,85 +1,80 @@
-//
-//  Speedometer.h
-//  comple.test
-//
-//  Created by Sergey Shramchenko on 24/05/2020.
-//  Copyright © 2020 Home. All rights reserved.
-//
+#ifndef SPEEDOMETER_H
+#define SPEEDOMETER_H
 
-#ifndef Speedometer_h
-#define Speedometer_h
-
-#include <stdint.h>
 #include <chrono>
 #include <queue>
+#include <cstdint>
+#include <algorithm>
 
 namespace Helpers {
 
-class Speedometer
-{
+class Speedometer {
 public:
-    Speedometer(std::uint32_t dataSizeToMesure)
-    : m_dataLimit (dataSizeToMesure)
-    {
-        Start();
-    }
-    void Start() {
-        while(!m_steps.empty()) m_steps.pop();
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = Clock::time_point;
+    using Duration = Clock::duration;
+
+    explicit Speedometer(uint64_t dataWindowSize) noexcept
+        : m_dataWindowSize(dataWindowSize) {}
+
+    void Reset() noexcept {
+        m_steps = {};
         m_totalBytes = 0;
-        m_totalSec = 0.0;
-        m_stepStart = std::chrono::system_clock::now();
+        m_totalSeconds = 0.0;
     }
-    
-    void StartStep()
-    {
-        m_stepStart = std::chrono::system_clock::now();
+
+    void StartMeasurement() noexcept {
+        m_currentStart = Clock::now();
+    }
+
+    void FinishMeasurement(uint64_t bytesTransferred) noexcept {
+        const auto end = Clock::now();
+        AddStep({m_currentStart, end, bytesTransferred});
+        m_currentStart = end;
+    }
+
+    double GetBps() const noexcept {
+        return m_totalSeconds > 0.0 ? m_totalBytes / m_totalSeconds : 0.0;
+    }
+
+    double GetKBps() const noexcept { return GetBps() / 1024; }
+    double GetMBps() const noexcept { return GetKBps() / 1024; }
+
+    uint64_t GetTotalBytes() const noexcept { return m_totalBytes; }
+    double GetTotalSeconds() const noexcept { return m_totalSeconds; }
+
+private:
+    struct MeasurementStep {
+        TimePoint start;
+        TimePoint end;
+        uint64_t bytes;
         
-    }
-    void StepDone(ssize_t chunkSize)
-    {
-        m_steps.emplace(m_stepStart, std::chrono::system_clock::now(), chunkSize);
-        const auto& last = m_steps.back();
-        m_totalBytes += last.howMany;
-        m_totalSec += last.Seconds();
-        m_stepStart = last.to;
-        while(m_totalBytes > m_dataLimit) {
-            const auto& first = m_steps.front();
-            m_totalBytes -= first.howMany;
-            m_totalSec -= first.Seconds();
+        double duration() const {
+            return std::chrono::duration<double>(end - start).count();
+        }
+    };
+
+    void AddStep(MeasurementStep&& step) {
+        m_steps.push(std::move(step));
+        m_totalBytes += step.bytes;
+        m_totalSeconds += step.duration();
+        
+        // Maintain sliding window
+        while (m_totalBytes > m_dataWindowSize && !m_steps.empty()) {
+            const auto& oldest = m_steps.front();
+            m_totalBytes -= oldest.bytes;
+            m_totalSeconds -= oldest.duration();
             m_steps.pop();
         }
     }
-    
-    uint32_t BytesPerSecond() const { return m_totalBytes / m_totalSec; }
-    float KBytesPerSecond() const { return m_totalBytes / m_totalSec / 1024; }
-    float MBytesPerSecond() const { return m_totalBytes / m_totalSec / 1024 / 1024 ; }
-private:
-    typedef std::chrono::time_point<std::chrono::system_clock> time_point;
-    struct StepInfo
-    {
-        StepInfo(const time_point& f, const time_point& t, ssize_t d)
-        : from(f), to(t), howMany(d)
-        {}
-        StepInfo(StepInfo && other)
-        : from(other.from), to(other.to), howMany(other.howMany)
-        {}
-        inline float Seconds() const
-        {
-            std::chrono::duration<float> diff = to - from;
-            return diff.count();
-        }
-        const time_point from;
-        const time_point to;
-        const ssize_t howMany;
-    };
-    std::queue<StepInfo> m_steps;
-    const std::uint32_t m_dataLimit;
-    uint32_t m_totalBytes;
-    float m_totalSec;
-    time_point m_stepStart;
-    
+
+    std::queue<MeasurementStep> m_steps;
+    TimePoint m_currentStart;
+    uint64_t m_dataWindowSize;
+    uint64_t m_totalBytes = 0;
+    double m_totalSeconds = 0.0;
 };
 
-} //Helpers
+} // namespace Helpers
 
-#endif /* Speedometer_h */
+#endif // SPEEDOMETER_H
