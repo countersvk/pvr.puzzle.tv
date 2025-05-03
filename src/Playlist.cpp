@@ -1,345 +1,250 @@
-/*
- *
- *   Copyright (C) 2018 Sergey Shramchenko
- *   https://github.com/srg70/pvr.puzzle.tv
- *
- *  This Program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
- *  any later version.
- *
- *  This Program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with XBMC; see the file COPYING.  If not, write to
- *  the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
- *  http://www.gnu.org/copyleft/gpl.html
- *
- */
-
-#if (defined(_WIN32) || defined(_WIN64))
-#define __STDC_FORMAT_MACROS
-#endif
-#include <inttypes.h>
-#include "HttpEngine.hpp"
+#include <chrono>
+#include <cinttypes>
+#include <kodi/AddonBase.h>
+#include <kodi/Filesystem.h>
 #include "Playlist.hpp"
-#include "globals.hpp"
+#include "HttpEngine.hpp"
 #include "helpers.h"
-#include "p8-platform/util/StringUtils.h"
+
+using namespace std::chrono;
 
 namespace Buffers {
-using namespace Globals;
-using namespace Helpers;
 
-static std::string ToAbsoluteUrl(const std::string& url, const std::string& baseUrl){
-    const char* c_HTTP = "http://";
-    const char* c_HTTPS = "https://";
+std::string ToAbsoluteUrl(const std::string& url, const std::string& baseUrl)
+{
+    const std::string_view schemes[] = {"http://", "https://"};
     
-    // If url is reliative URL
-    if(std::string::npos == url.find(c_HTTP)) {
-        std::string absUrl;
-        // Append site prefix... (from baseUrl)
-        // Find schema.
-        auto urlPos = baseUrl.find(c_HTTP);
-        if(std::string::npos != urlPos){
-            urlPos += strlen(c_HTTP);
-        } else {
-            urlPos = baseUrl.find(c_HTTPS);
-            if(std::string::npos == urlPos)
-                throw PlaylistException((std::string("Missing http:// or https:// in base URL: ") + baseUrl).c_str());
-            urlPos += strlen(c_HTTPS);
+    if (url.find("://") != std::string::npos)
+        return url;
+
+    for (auto scheme : schemes) {
+        size_t pos = baseUrl.find(scheme);
+        if (pos != std::string::npos) {
+            pos += scheme.size();
+            size_t domain_end = baseUrl.find('/', pos);
+            if (domain_end == std::string::npos)
+                return baseUrl + "/" + url;
+            
+            std::string base_path = baseUrl.substr(domain_end);
+            size_t last_slash = base_path.rfind('/');
+            if (last_slash != std::string::npos) {
+                base_path = base_path.substr(0, last_slash + 1);
+            }
+            return baseUrl.substr(0, domain_end) + base_path + url;
         }
-        // Find site
-        urlPos = baseUrl.find('/', urlPos);
-        if(std::string::npos == urlPos) {
-            throw PlaylistException((std::string("Missing site address in base URL: ") + baseUrl).c_str());
-        }
-        absUrl = baseUrl.substr(0, urlPos + 1); // +1 for '/'
-        std::string urlPath = baseUrl.substr(urlPos + 1);
-        // Find path
-        urlPos = urlPath.rfind('/');
-        if(std::string::npos != urlPos) {
-            //throw PlaylistException((std::string("No '/' in base URL: ") + baseUrl).c_str());
-            urlPath = urlPath.substr(0, urlPos + 1); // +1 for '/'
-        }
-        urlPath += url;
-        absUrl += urlPath;//HttpEngine::Escape(urlPath);
-        //trim(absUrl);
-        return absUrl;
-        
     }
-    return url;
     
+    throw PlaylistException("Invalid base URL: " + baseUrl);
 }
 
-static uint64_t ParseXstreamInfTag(const std::string& data, std::string& url)
+uint64_t ParseXstreamInfTag(const std::string& data, std::string& url)
 {
-    const char* c_BAND = "BANDWIDTH=";
+    constexpr auto bandwidth_tag = "BANDWIDTH=";
+    size_t pos = data.find(bandwidth_tag);
     
-    auto pos = data.find(c_BAND);
-    if(std::string::npos == pos)
-        throw PlaylistException("Invalid playlist format: missing BANDWIDTH in #EXT-X-STREAM-INF tag.");
-    pos += strlen(c_BAND);
-    uint64_t bandwidth = std::stoull(data.substr(pos), &pos);
-    pos = data.find('\n', pos);
-    if(std::string::npos == pos)
-        throw PlaylistException("Invalid playlist format: missing NEW LINE in #EXT-X-STREAM-INF tag.");
-    url = data.substr(++pos);
+    if (pos == std::string::npos)
+        throw PlaylistException("Missing BANDWIDTH in EXT-X-STREAM-INF");
+        
+    pos += strlen(bandwidth_tag);
+    uint64_t bandwidth = stoull(data.substr(pos));
+    
+    size_t url_start = data.find('\n', pos) + 1;
+    url = data.substr(url_start);
     trim(url);
+    
     return bandwidth;
 }
 
-static bool IsPlaylistContent(const std::string& content) {
-    const char* c_M3U = "#EXTM3U";
-    return  content.find(c_M3U) != std::string::npos;
+bool IsPlaylistContent(const std::string& content)
+{
+    return content.find("#EXTM3U") != std::string::npos;
 }
 
-Playlist::Playlist(const std::string &urlOrContent, uint64_t indexOffset)
-: m_indexOffset(indexOffset)
-, m_targetDuration(0)
-, m_initialInternalIndex(-1)
+Playlist::Playlist(const std::string& urlOrContent, uint64_t indexOffset)
+    : m_indexOffset(indexOffset),
+      m_targetDuration(0),
+      m_initialInternalIndex(-1)
 {
-    const std::string* pData (&urlOrContent);
-    std::string data;
-    if(!IsPlaylistContent(urlOrContent)){
+    if (!IsPlaylistContent(urlOrContent)) {
         m_playListUrl = urlOrContent;
+        size_t headers_pos = m_playListUrl.find('|');
         
-        // Kodi's HTTP headers schema.
-        LogDebug("Playlist::Playlist(): original URL %s", m_playListUrl.c_str());
-        auto headersPos = m_playListUrl.find("|");
-        if(headersPos != std::string::npos){
-            m_httplHeaders = m_playListUrl.substr(headersPos);
-            m_playListUrl = m_playListUrl.substr(0,headersPos);
-            LogDebug("Playlist::Playlist(): HTTP headers %s", m_httplHeaders.c_str());
+        if (headers_pos != std::string::npos) {
+            m_httplHeaders = m_playListUrl.substr(headers_pos);
+            m_playListUrl = m_playListUrl.substr(0, headers_pos);
         }
         
+        std::string data;
         LoadPlaylist(data);
-        pData = &data;
+        SetBestPlaylist(data);
+    } else {
+        SetBestPlaylist(urlOrContent);
     }
-    SetBestPlaylist(*pData);
-    
 }
 
 void Playlist::SetBestPlaylist(const std::string& data)
 {
-    const char* c_XINF = "#EXT-X-STREAM-INF:";
-    m_loadIterator = 0;
-    auto pos = data.find(c_XINF);
-    // Do we have bitstream info to choose best strea?
-    if(std::string::npos != pos) {
-        //    LogDebug("Variant playlist URL: \n %s", playlistUrl.c_str() );
-        //    LogDebug("Variant playlist: \n %s", data.c_str() );
+    constexpr auto stream_inf_tag = "#EXT-X-STREAM-INF:";
+    size_t pos = data.find(stream_inf_tag);
+    
+    if (pos != std::string::npos) {
+        uint64_t best_rate = 0;
         
-        uint64_t bestRate = 0;
-        while(std::string::npos != pos)
-        {
-            pos += strlen(c_XINF);
-            auto endTag = data.find("#",pos);
-            std::string::size_type tagLen = endTag - pos;
-            if(std::string::npos == endTag)
-                tagLen = std::string::npos;
-            
-            std::string tagBody = data.substr(pos, tagLen);
-            pos = data.find(c_XINF,pos);
+        while (pos != std::string::npos) {
+            pos += strlen(stream_inf_tag);
+            size_t end_tag = data.find('#', pos);
+            std::string tag_body = data.substr(pos, end_tag - pos);
             
             std::string url;
-            uint64_t rate = ParseXstreamInfTag(tagBody, url);
-            if(rate > bestRate) {
+            uint64_t rate = ParseXstreamInfTag(tag_body, url);
+            
+            if (rate > best_rate) {
                 m_playListUrl = ToAbsoluteUrl(url, m_effectivePlayListUrl);
-                m_effectivePlayListUrl.clear();
-                bestRate = rate;
+                best_rate = rate;
             }
+            
+            pos = data.find(stream_inf_tag, end_tag);
         }
-        //    LogDebug("Best URL (%d): \n %s", bestRate, m_playListUrl.c_str() );
-        std::string newData;
-        LoadPlaylist(newData);
-        ParsePlaylist(newData);
+        
+        std::string new_data;
+        LoadPlaylist(new_data);
+        ParsePlaylist(new_data);
     } else {
         ParsePlaylist(data);
     }
     
-    // Init load iterator with media index of first segment
-    const auto first = m_segmentUrls.begin();
-    if( first != m_segmentUrls.end()){
-        m_loadIterator = first->first;
+    if (!m_segmentUrls.empty()) {
+        m_loadIterator = m_segmentUrls.begin()->first;
     }
 }
 
 bool Playlist::ParsePlaylist(const std::string& data)
 {
-    const char* c_M3U = "#EXTM3U";
-    const char* c_INF = "#EXTINF:";
-    const char* c_SEQ = "#EXT-X-MEDIA-SEQUENCE:";
-    const char* c_TYPE = "#EXT-X-PLAYLIST-TYPE:";
-    const char* c_TARGET = "#EXT-X-TARGETDURATION:";
-    const char* c_CACHE = "#EXT-X-ALLOW-CACHE:"; // removed in v7 but in use by TTV :(
-    const char* c_END = "#EXT-X-ENDLIST";
-    
     try {
-        auto pos = data.find(c_M3U);
-        if(std::string::npos == pos)
-            throw PlaylistException("Invalid playlist format: missing #EXTM3U tag.");
-        pos += strlen(c_M3U);
+        constexpr auto target_duration_tag = "#EXT-X-TARGETDURATION:";
+        size_t pos = data.find(target_duration_tag);
         
-        // Fill target duration value (mandatory tag)
-        pos = data.find(c_TARGET);
-        if(std::string::npos == pos)
-            throw PlaylistException("Invalid playlist format: missing #EXT-X-TARGETDURATION tag.");
-        
-        pos += strlen(c_TARGET);
-        m_targetDuration = std::stoi(data.substr(pos), &pos);
-        
-        // Playlist may be sub-sequence of some bigger stream (e.g. archive at Edem)
-        // Initial index offset helps to right possitionig of segments range
-        int64_t mediaIndex = m_indexOffset;
-        // use playlist indexing
-        std::string  body;
-        pos = data.find(c_SEQ);
-        // If we have media-sequence tag - use it
-        if(std::string::npos != pos) {
-            pos += strlen(c_SEQ);
-            body = data.substr(pos);
-            auto internaIndex = std::stoull(body, &pos);
-            // Initialize internal index of playlist on first loading
-            if(-1 == m_initialInternalIndex) {
-                m_initialInternalIndex = internaIndex;
-            }
-            mediaIndex +=  internaIndex - m_initialInternalIndex;
-        }
-        
-        // VOD should contain END tag
-        pos = data.find(c_END);
-        m_isVod = pos != std::string::npos;
-        body=data.substr(0, pos);
-        
-        pos = body.find(c_INF);
-        bool hasContent = false;
-        // Load playlist segments
-        while(std::string::npos != pos) {
-            pos += strlen(c_INF);
-            body = body.substr(pos);
-            float duration = std::stof (body, &pos);
-            if(',' != body[pos++])
-                throw PlaylistException("Invalid playlist format: missing coma after INF tag.");
+        if (pos == std::string::npos)
+            throw PlaylistException("Missing EXT-X-TARGETDURATION");
             
-            const std::string::size_type urlPos = body.find('\n',pos) + 1;
-            pos = body.find('\n', urlPos);
-            hasContent = true;
-            // Check whether we have a segment already
-            if(m_segmentUrls.count(mediaIndex) == 0) {
-                std::string::size_type urlLen = pos - urlPos;
-                if(std::string::npos == pos)
-                    urlLen = std::string::npos;
-                auto url = body.substr(urlPos, urlLen);
-                trim(url);
-                url = ToAbsoluteUrl(url, m_effectivePlayListUrl) + m_httplHeaders;
-                LogDebug("Plist::ParsePlist(): new segment URL IDX: #%" PRIu64 " Duration: %f. URL: %s", mediaIndex, duration, url.c_str());
-                TimeOffset relativeSeegmetStart = GetTimeOffset();
-                // Set reliative segment start time to either previous segment end time or 0.0 for first one
-                if(m_segmentUrls.count(mediaIndex - 1)){
-                    const auto& prevSegment = m_segmentUrls.at(mediaIndex - 1);
-                    relativeSeegmetStart = prevSegment.startTime + prevSegment.duration;
-                }
-                m_segmentUrls[mediaIndex] = TSegmentUrls::mapped_type(relativeSeegmetStart, duration, url, mediaIndex);
+        pos += strlen(target_duration_tag);
+        m_targetDuration = stoi(data.substr(pos));
+
+        constexpr auto media_sequence_tag = "#EXT-X-MEDIA-SEQUENCE:";
+        pos = data.find(media_sequence_tag);
+        int64_t media_index = m_indexOffset;
+        
+        if (pos != std::string::npos) {
+            pos += strlen(media_sequence_tag);
+            uint64_t internal_index = stoull(data.substr(pos));
+            
+            if (m_initialInternalIndex == -1) {
+                m_initialInternalIndex = internal_index;
             }
-            ++mediaIndex;
-            pos = body.find(c_INF, urlPos);
+            
+            media_index += internal_index - m_initialInternalIndex;
         }
-        LogDebug("m_segmentUrls.size = %d, %s", m_segmentUrls.size(), hasContent ? "Not empty." : "Empty."  );
-        return hasContent;
-    } catch (std::exception& ex) {
-        LogError("Bad M3U : parser error %s", ex.what() );
-        LogError("M3U data : \n %s", data.c_str() );
-        throw;
-    } catch (...) {
-        LogError("Bad M3U : \n %s", data.c_str() );
+
+        m_isVod = data.find("#EXT-X-ENDLIST") != std::string::npos;
+
+        constexpr auto inf_tag = "#EXTINF:";
+        pos = data.find(inf_tag);
+        bool has_content = false;
+        
+        while (pos != std::string::npos) {
+            pos += strlen(inf_tag);
+            size_t comma_pos = data.find(',', pos);
+            float duration = stof(data.substr(pos, comma_pos - pos));
+            
+            size_t url_start = data.find('\n', comma_pos) + 1;
+            size_t url_end = data.find('\n', url_start);
+            std::string url = data.substr(url_start, url_end - url_start);
+            trim(url);
+            
+            url = ToAbsoluteUrl(url, m_effectivePlayListUrl) + m_httplHeaders;
+            
+            TimeOffset start_time = GetTimeOffset();
+            
+            if (!m_segmentUrls.empty()) {
+                const auto& prev = m_segmentUrls.rbegin()->second;
+                start_time = prev.startTime + prev.duration;
+            }
+            
+            m_segmentUrls.emplace(media_index, 
+                SegmentInfo{start_time, duration, url, media_index});
+            
+            ++media_index;
+            pos = data.find(inf_tag, url_end);
+            has_content = true;
+        }
+        
+        return has_content;
+    } catch (const std::exception& e) {
+        kodi::Log(ADDON_LOG_ERROR, "Playlist parse error: %s", e.what());
         throw;
     }
 }
-
 
 void Playlist::LoadPlaylist(std::string& data) const
 {
-    char buffer[1024];
-    
-    const std::string& requestUrl = (m_effectivePlayListUrl.empty()) ? m_playListUrl : m_effectivePlayListUrl;
-    
-    LogDebug(">>> PlaylistBuffer: (re)loading playlist %s", requestUrl.c_str());
-    
-    bool succeeded = false;
-    try{
-        //m_effectivePlayListUrl.clear();
+    try {
+        kodi::vfs::CFile file;
+        std::string url = m_effectivePlayListUrl.empty() ? 
+            m_playListUrl : m_effectivePlayListUrl;
         
-        std::vector<std::string> headers;
-        if(!m_httplHeaders.empty()) {
-            auto headerStrings = StringUtils::Split(m_httplHeaders.substr(1), "=");
-            auto headerStringsSize = headerStrings.size();
-            int i = 0;
-            while(i < headerStringsSize) {
-                const auto& headerName = headerStrings[i++];
-                if(i >= headerStringsSize)
-                    continue;
-                const auto& headerValue = headerStrings[i++];
-                headers.push_back(headerName + ":" + headerValue);
-            }
+        if (!file.CURLCreate(url) || !file.CURLOpen(0)) {
+            throw PlaylistException("Failed to open playlist URL");
         }
         
-        HttpEngine::Request request(requestUrl, "", headers);
-        HttpEngine::DoCurl(request, HttpEngine::TCookies(), &data, 9999999, &m_effectivePlayListUrl);
-        succeeded = true;
+        char buffer[4096];
+        ssize_t bytes_read;
         
-    }catch (std::exception& ex) {
-        LogError("Playlist::LoadPlaylist(): STD exception: %s",  ex.what());
-    }catch (...) {
-        LogError("Playlist::LoadPlaylist(): unknown exception.");
+        while ((bytes_read = file.Read(buffer, sizeof(buffer))) > 0) {
+            data.append(buffer, bytes_read);
+        }
+        
+        size_t headers_pos = url.find('|');
+        if (headers_pos != std::string::npos) {
+            m_effectivePlayListUrl = url.substr(0, headers_pos);
+        }
+    } catch (const std::exception& e) {
+        kodi::Log(ADDON_LOG_ERROR, "Playlist load error: %s", e.what());
+        throw PlaylistException("Playlist load failed");
     }
-    
-    if (!succeeded)
-        throw PlaylistException("Failed to obtain playlist from server.");
-    
-    LogDebug(">>> PlaylistBuffer: playlist effective URL %s", m_effectivePlayListUrl.c_str());
-    LogDebug(">>> PlaylistBuffer: (re)loading done. Content: \n%s", data.substr(0, 16000).c_str());
-    
 }
 
-bool Playlist::Reload() {
-    // For VOD plist we can't reload/refresh.
-    if(m_isVod)
-        return true;
+bool Playlist::Reload()
+{
+    if (m_isVod) return true;
+    
     try {
         std::string data;
         LoadPlaylist(data);
-        // Empty playlist treat as EOF.
         return ParsePlaylist(data);
-    } catch (std::exception& ex) {
-        LogError("Playlist: FAILED to reload playlist. Error: %s", ex.what());
-    }
-    return false;
-}
-
-bool Playlist::NextSegment(SegmentInfo& info, bool& hasMoreSegments) {
-    hasMoreSegments = false;
-    //        LogDebug("Playlist: searching for segment info #%" PRIu64 "...", m_loadIterator);
-    if(m_segmentUrls.count(m_loadIterator) != 0) {
-        info = m_segmentUrls[m_loadIterator++];
-        hasMoreSegments = m_segmentUrls.count(m_loadIterator) > 0;
-        //            LogDebug("Playlist: segment info is found. Has more? %s", hasMoreSegments ? "YES" : "NO");
-        return true;
-    }
-    //        LogDebug("Playlist: segment info is missing");
-    return false;
-}
-
-bool Playlist::SetNextSegmentIndex(uint64_t idx) {
-    if(m_segmentUrls.count(idx) == 0) {
-        LogDebug("Playlist: failed to set next segment #%" PRIu64 ". m_segmentUrls contains serments [%" PRIu64 ", %" PRIu64 "].", idx, m_segmentUrls.begin()->first, (--m_segmentUrls.end())->first);
+    } catch (...) {
         return false;
     }
-    m_loadIterator = idx;
-    LogDebug("Playlist: next segment index been set to segment #%" PRIu64 ".", m_loadIterator);
-    return true;
+}
+
+bool Playlist::NextSegment(SegmentInfo& info, bool& hasMore)
+{
+    auto it = m_segmentUrls.find(m_loadIterator);
+    
+    if (it != m_segmentUrls.end()) {
+        info = it->second;
+        hasMore = m_segmentUrls.count(++m_loadIterator) > 0;
+        return true;
+    }
+    
+    return false;
+}
+
+bool Playlist::SetNextSegmentIndex(uint64_t index)
+{
+    if (m_segmentUrls.count(index)) {
+        m_loadIterator = index;
+        return true;
+    }
+    return false;
 }
 }
