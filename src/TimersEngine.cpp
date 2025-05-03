@@ -1,333 +1,227 @@
-/*
- *
- *   Copyright (C) 2018 Sergey Shramchenko
- *   https://github.com/srg70/pvr.puzzle.tv
- *
- *  This Program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
- *  any later version.
- *
- *  This Program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with XBMC; see the file COPYING.  If not, write to
- *  the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
- *  http://www.gnu.org/copyleft/gpl.html
- *
- */
-
-#define NOMINMAX
-
 #include <algorithm>
+#include <memory>
+#include <filesystem>
+#include <set>
+#include <atomic>
+#include <condition_variable>
+#include <kodi/addon/pvr/Timers.h>
+#include <kodi/Filesystem.h>
 #include "TimersEngine.hpp"
 #include "globals.hpp"
 
-using namespace Globals;
+using namespace std::chrono;
+namespace fs = std::filesystem;
 
+namespace Engines {
+    // Константы путей
+    const fs::path CACHE_DIR = "special://temp/pvr-puzzle-tv/";
+    const fs::path CACHE_FILE = CACHE_DIR / "timers.dat";
+    
+    // Вспомогательная функция для преобразования времени
+    static time_t to_time_t(const system_clock::time_point& tp) {
+        return system_clock::to_time_t(tp);
+    }
 
-static const char* c_TimersCacheDirPath = "special://temp/pvr-puzzle-tv/";
-static const char* c_TimersCachePath = "special://temp/pvr-puzzle-tv/timers.dat";
-namespace Engines
-{
-    static unsigned int s_LastTimerIndex = PVR_TIMER_NO_CLIENT_INDEX;
-    
-    static void DumpTimer(const kodi::addon::PVRTimer& timer);
-    
-    class Timer{
+    class Timer {
     public:
-        Timer(const kodi::addon::PVRTimer& t)
-        : m_pvrTimer(t)
+        explicit Timer(const kodi::addon::PVRTimer& timer) 
+            : m_pvrTimer(timer) 
         {
-            m_pvrTimer.SetClientIndex(++s_LastTimerIndex);
+            m_pvrTimer.SetClientIndex(++s_lastIndex);
+        }
 
+        system_clock::time_point start_time() const {
+            return system_clock::from_time_t(
+                m_pvrTimer.GetStartTime() - m_pvrTimer.GetMarginStart() * 60);
         }
-        ~Timer(){}
-        
-        inline time_t StartTime() const
-        {
-            return m_pvrTimer.GetStartTime() - m_pvrTimer.GetMarginStart() * 60;
+
+        system_clock::time_point end_time() const {
+            return system_clock::from_time_t(
+                m_pvrTimer.GetEndTime() + m_pvrTimer.GetMarginEnd() * 60);
         }
-        inline time_t EndTime() const
-        {
-            return m_pvrTimer.GetEndTime() + m_pvrTimer.GetMarginEnd() * 60;
-        }
-        inline void Schedule()
-        {
+
+        void schedule() {
             m_pvrTimer.SetState(PVR_TIMER_STATE_SCHEDULED);
-            LogDebug("Timer %s %s", m_pvrTimer.GetTitle().c_str(), "scheduled" );
+            kodi::Log(ADDON_LOG_DEBUG, "Timer %s scheduled", title().c_str());
         }
-        inline bool StartRecording(ITimersEngineDelegate* delegate)
-        {
-            bool started = false;
-            try {
-                started = delegate->StartRecordingFor(m_pvrTimer);
-            } catch (std::exception& ex) {
-                LogError("Exception during recording creation: %s", ex.what());
-            } catch (...) {
-                LogError("Exception during recording creation: unknown");
-            }
-            m_pvrTimer.SetState(started ? PVR_TIMER_STATE_RECORDING : PVR_TIMER_STATE_ERROR);
-            LogDebug("Timer %s %s", m_pvrTimer.GetTitle().c_str(), started ? "started" : "failed to start" );
-            return started;
-        }
-        inline bool StopRecording(ITimersEngineDelegate* delegate)
-        {
-            bool stopped = delegate->StopRecordingFor(m_pvrTimer);
 
-            if(stopped) {
-                const bool isCompleted = EndTime() <= time(nullptr);
-                m_pvrTimer.SetState(isCompleted ?  PVR_TIMER_STATE_COMPLETED : PVR_TIMER_STATE_CANCELLED);
-                LogDebug("Timer %s %s", m_pvrTimer.GetTitle().c_str(), isCompleted ? "completed" : "cancelled" );
-            } else {
-                m_pvrTimer.SetState(PVR_TIMER_STATE_ERROR);
-                LogDebug("Timer %s %s", m_pvrTimer.GetTitle().c_str(), "failed to stop" );
+        bool start_recording(ITimersEngineDelegate* delegate) {
+            bool success = false;
+            try {
+                success = delegate->StartRecordingFor(m_pvrTimer);
+            } 
+            catch (const std::exception& e) {
+                kodi::Log(ADDON_LOG_ERROR, "Recording error: %s", e.what());
             }
-            return stopped;
+            
+            m_pvrTimer.SetState(success ? 
+                PVR_TIMER_STATE_RECORDING : 
+                PVR_TIMER_STATE_ERROR);
+            
+            return success;
+        }
+
+        bool stop_recording(ITimersEngineDelegate* delegate) {
+            const bool success = delegate->StopRecordingFor(m_pvrTimer);
+            const auto state = success ? 
+                (time(nullptr) >= end_time().time_since_epoch().count() ? 
+                    PVR_TIMER_STATE_COMPLETED : 
+                    PVR_TIMER_STATE_CANCELLED) : 
+                PVR_TIMER_STATE_ERROR;
+            
+            m_pvrTimer.SetState(state);
+            return success;
+        }
+
+        const std::string& title() const { 
+            return m_pvrTimer.GetTitle(); 
         }
 
         kodi::addon::PVRTimer m_pvrTimer;
+
+    private:
+        inline static std::atomic_uint s_lastIndex = PVR_TIMER_NO_CLIENT_INDEX;
     };
-    
-    bool TimersEngine::CompareTimerPtr(const Engines::TimersEngine::TimerPtr &left, const Engines::TimersEngine::TimerPtr &right)
-    {
-        return left->StartTime() < right->StartTime();
-    }
-    
+
+    // Компаратор для умных указателей
+    struct TimerCompare {
+        bool operator()(const std::unique_ptr<Timer>& a, 
+                       const std::unique_ptr<Timer>& b) const {
+            return a->start_time() < b->start_time();
+        }
+    };
+
     TimersEngine::TimersEngine(ITimersEngineDelegate* delegate)
-    : m_timers(&CompareTimerPtr)
-    , m_delegate(delegate)
+        : m_delegate(delegate)
+        , m_worker([this](std::stop_token st) { process(st); })
     {
-        LoadCache();
-        CreateThread();
+        load_cache();
     }
-    
-    TimersEngine::~TimersEngine()
-    {
-        StopThread(-1);
-        m_checkTimers.Signal();
-        StopThread();
-        SaveCache();
-    }
-    
-    void TimersEngine::LoadCache()
-    {
-        LogDebug("Timer Engine: loading cache....");
-        
-        auto file = XBMC_OpenFile(c_TimersCachePath);
-        if(NULL == file) {
-            LogDebug("Timer Engine: no cache file found");
-            return;
-        }
-        // Header
-        int32_t size = 0;
-        bool isEOF = file->Read(&size, sizeof(size)) < sizeof(size);
-        // Content
-        PVR_TIMER timer;
-        while (size-- > 0 && !isEOF) {
-            isEOF = file->Read(&timer, sizeof(timer)) > sizeof(timer);
-            if(isEOF)
-                continue;
-            if(timer.state == PVR_TIMER_STATE_RECORDING)
-                timer.state = PVR_TIMER_STATE_ABORTED;
-            // Construct timer from serialized C-struct
-            auto t = kodi::addon::PVRTimer();
-            *(PVR_TIMER*)t = timer;
-            m_timers.insert(Timers::value_type(new Timer(t)));
-            
-        }
-        file->Close();
-        delete file;
-        file = nullptr;
-        LogDebug("Timer Engine: loading cache done. %d timers found", m_timers.size());
-    }
-    
-    void TimersEngine::SaveCache() const
-    {
 
-        LogDebug("Timer Engine: saving cache....");
-        kodi::vfs::CreateDirectory(c_TimersCacheDirPath);
+    TimersEngine::~TimersEngine() {
+        m_worker.request_stop();
+        m_cv.notify_all();
+        save_cache();
+    }
+
+    void TimersEngine::load_cache() {
+        kodi::vfs::CreateDirectory(CACHE_DIR.string());
         
-        kodi::vfs::CFile file;
-        file.OpenFileForWrite(c_TimersCachePath, true);
-        if(!file.IsOpen()) {
-            LogError("Timer Engine: failed to open cache file for write. %s", c_TimersCachePath);
+        auto file = kodi::vfs::CFile(CACHE_FILE.string());
+        if (!file.Open()) {
+            kodi::Log(ADDON_LOG_DEBUG, "No timer cache found");
             return;
         }
 
-        // Header
-        int32_t size = m_timers.size();
-        bool failed = file.Write(&size, sizeof(size))  != sizeof(size);
-        // Content
-        for (const auto& pTimer : m_timers) {
-            if(failed)
-                break;
-            // Obtain timers' C-struc for serialization
-            const auto& pvrTimer = *pTimer->m_pvrTimer.GetCStructure();
-            failed = file.Write(&pvrTimer, sizeof(pvrTimer)) != sizeof(pvrTimer);
-        }
-        file.Close();
-        
-        if(failed){
-            kodi::vfs::DeleteFile(c_TimersCachePath);
-            LogError("Timer Engine: failed to save all timers to cache.");
-        } else {
-            LogDebug("Timer Engine: saving cache done");
-        }
-
-    }
-    
-    void *TimersEngine::Process()
-    {
-        LogDebug("Timer Engine: thread started.");
-        while(!IsStopped()) {
-            LogDebug("Timer Engine: thread iteration started...");
-
-            const time_t now = time(nullptr);
-            time_t nextWakeUpTime = now;
+        std::lock_guard lock(m_mutex);
+        try {
+            int32_t count;
+            file.Read(&count, sizeof(count));
             
-            // Stop active recordings first
-            for (auto& pTimer : m_timers) {
-                const time_t startTime = pTimer->StartTime();
-                const time_t endTime = pTimer->EndTime();
-                double delta = difftime(endTime, now);
-                // Check for recording timers to STOP recording
-                if(pTimer->m_pvrTimer.GetState() == PVR_TIMER_STATE_RECORDING){
-                    if(delta <= 0) {
-                        pTimer->StopRecording(m_delegate);
-                    } else {
-                        nextWakeUpTime = nextWakeUpTime == now ? endTime :
-                            difftime(nextWakeUpTime, endTime) > 0 ? endTime : nextWakeUpTime;
-                    }
+            while (count-- > 0) {
+                PVR_TIMER timer;
+                file.Read(&timer, sizeof(timer));
+                
+                auto t = std::make_unique<Timer>(kodi::addon::PVRTimer(timer));
+                if (t->m_pvrTimer.GetState() == PVR_TIMER_STATE_RECORDING) {
+                    t->m_pvrTimer.SetState(PVR_TIMER_STATE_ABORTED);
                 }
+                m_timers.insert(std::move(t));
             }
-            // Start scheduled timers
-            for (auto& pTimer : m_timers) {
-                const time_t startTime = pTimer->StartTime();
-                const time_t endTime = pTimer->EndTime();
-                double delta = difftime(startTime, now);
-                // Check for scheduled timers to START recording
-                if(pTimer->m_pvrTimer.GetState() == PVR_TIMER_STATE_SCHEDULED && endTime > now){
-                    if( delta <= 0 ) {
-                        pTimer->StartRecording(m_delegate);
-                        nextWakeUpTime = nextWakeUpTime == now ? endTime :
-                            difftime(nextWakeUpTime, endTime) > 0 ? endTime : nextWakeUpTime;
-                    } else {
-                        nextWakeUpTime = nextWakeUpTime == now ? startTime :
-                            difftime(nextWakeUpTime, startTime) > 0 ? startTime : nextWakeUpTime; 
-                    }
-                }
-
-             }
-
-            PVR->Addon_TriggerTimerUpdate();
-
-            double waitTimeout = difftime(nextWakeUpTime, now);
-            if(waitTimeout < 0) {
-                waitTimeout = 1; // Shouldn't be true
-            }
-            LogDebug("Timer Engine: thread waiting %f sec (0 - forever)", waitTimeout);
-            m_checkTimers.Wait(waitTimeout * 1000 );
         }
-        LogDebug("Timer Engine: thread stopped.");
+        catch (const std::exception& e) {
+            kodi::Log(ADDON_LOG_ERROR, "Cache load error: %s", e.what());
+        }
+    }
+
+    void TimersEngine::save_cache() const {
+        std::lock_guard lock(m_mutex);
         
-        return nullptr;
-    }
-    
-    int TimersEngine::GetTimersAmount(void)
-    {
-        return m_timers.size();
-    }
-    
-    PVR_ERROR TimersEngine::AddTimer(const kodi::addon::PVRTimer& timer)
-    {
-        DumpTimer(timer);
-        m_timers.insert(Timers::value_type(new Timer(timer)));
-        m_checkTimers.Signal();
-
-        SaveCache();
-        PVR->Addon_TriggerTimerUpdate();
-        return PVR_ERROR_NO_ERROR;
-    }
-    
-    PVR_ERROR TimersEngine::GetTimers(kodi::addon::PVRTimersResultSet& results)
-    {
-        for (const auto& t : m_timers) {
-            results.Add(t->m_pvrTimer);
+        try {
+            kodi::vfs::CFile file(CACHE_FILE.string(), ADDON_WRITE_TRUNCATED);
+            const int32_t count = m_timers.size();
+            file.Write(&count, sizeof(count));
+            
+            for (const auto& timer : m_timers) {
+                const auto data = *timer->m_pvrTimer.GetCStructure();
+                file.Write(&data, sizeof(data));
+            }
         }
-        return PVR_ERROR_NO_ERROR;
+        catch (const std::exception& e) {
+            kodi::Log(ADDON_LOG_ERROR, "Cache save error: %s", e.what());
+            fs::remove(CACHE_FILE);
+        }
     }
-    
-    PVR_ERROR TimersEngine::DeleteTimer(const kodi::addon::PVRTimer& timer, bool forceDelete)
-    {
-        for (const auto& t : m_timers) {
-            if(t->m_pvrTimer.GetClientIndex() == timer.GetClientIndex()) {
-                if(t->m_pvrTimer.GetState() == PVR_TIMER_STATE_RECORDING)
-                {
-                    if(!forceDelete)
-                        return PVR_ERROR_RECORDING_RUNNING;
-                    t->StopRecording(m_delegate);
+
+    void TimersEngine::process(std::stop_token st) {
+        while (!st.stop_requested()) {
+            std::unique_lock lock(m_mutex);
+            const auto now = system_clock::now();
+            auto next_wakeup = now + 24h;
+
+            // Обработка таймеров
+            for (const auto& timer : m_timers) {
+                const auto start = timer->start_time();
+                const auto end = timer->end_time();
+                
+                if (timer->m_pvrTimer.GetState() == PVR_TIMER_STATE_RECORDING) {
+                    if (end <= now) {
+                        timer->stop_recording(m_delegate);
+                    } else {
+                        next_wakeup = std::min(next_wakeup, end);
+                    }
                 }
-                m_timers.erase(t);
-                m_checkTimers.Signal();
-
-                SaveCache();
-                PVR->Addon_TriggerTimerUpdate();
-                return PVR_ERROR_NO_ERROR;
+                else if (timer->m_pvrTimer.GetState() == PVR_TIMER_STATE_SCHEDULED) {
+                    if (start <= now) {
+                        timer->start_recording(m_delegate);
+                        next_wakeup = std::min(next_wakeup, end);
+                    } else {
+                        next_wakeup = std::min(next_wakeup, start);
+                    }
+                }
             }
-        }
-        // Timer not found
-        return PVR_ERROR_INVALID_PARAMETERS;//PVR_ERROR_FAILED;
-    }
-    
-    PVR_ERROR TimersEngine::UpdateTimer(const kodi::addon::PVRTimer& timer)
-    {
-        for (const auto& t : m_timers) {
-            if(t->m_pvrTimer.GetClientIndex() == timer.GetClientIndex()) {
-                if(t->m_pvrTimer.GetState() == PVR_TIMER_STATE_RECORDING)
-                    t->StopRecording(m_delegate);
-                t->m_pvrTimer = kodi::addon::PVRTimer(timer);
-                DumpTimer(timer);
-                SaveCache();
-                m_checkTimers.Signal();
 
-                PVR->Addon_TriggerTimerUpdate();
-                return PVR_ERROR_NO_ERROR;
-            }
+            kodi::addon::CInstancePVRClient::TriggerTimerUpdate();
+            
+            m_cv.wait_until(lock, next_wakeup, [&] { 
+                return st.stop_requested(); 
+            });
         }
-        // Timer not found
-        return PVR_ERROR_INVALID_PARAMETERS;//PVR_ERROR_FAILED;
     }
-    
-    void DumpTimer(const kodi::addon::PVRTimer& timer) {
-        LogDebug("%s: iClientIndex = %d", __FUNCTION__, timer.GetClientIndex());
-        LogDebug("%s: iParentClientIndex = %d", __FUNCTION__, timer.GetParentClientIndex());
-        LogDebug("%s: iClientChannelUid = %d", __FUNCTION__, timer.GetClientChannelUid());
-        LogDebug("%s: startTime = %ld", __FUNCTION__, timer.GetStartTime());
-        LogDebug("%s: endTime = %ld", __FUNCTION__, timer.GetEndTime());
-        LogDebug("%s: state = %d", __FUNCTION__, timer.GetState());
-        LogDebug("%s: iTimerType = %d", __FUNCTION__, timer.GetTimerType());
-        LogDebug("%s: strTitle = %s", __FUNCTION__, timer.GetTitle().c_str());
-        LogDebug("%s: strEpgSearchString = %s", __FUNCTION__, timer.GetEPGSearchString().c_str());
-        LogDebug("%s: bFullTextEpgSearch = %d", __FUNCTION__, timer.GetFullTextEpgSearch());
-        LogDebug("%s: strDirectory = %s", __FUNCTION__, timer.GetDirectory().c_str());
-        LogDebug("%s: strSummary = %s", __FUNCTION__, timer.GetSummary().c_str());
-        LogDebug("%s: iPriority = %d", __FUNCTION__, timer.GetPriority());
-        LogDebug("%s: iLifetime = %d", __FUNCTION__, timer.GetLifetime());
-        LogDebug("%s: firstDay = %d", __FUNCTION__, timer.GetFirstDay());
-        LogDebug("%s: iWeekdays = %d", __FUNCTION__, timer.GetWeekdays());
-        LogDebug("%s: iPreventDuplicateEpisodes = %d", __FUNCTION__, timer.GetPreventDuplicateEpisodes());
-        LogDebug("%s: iEpgUid = %d", __FUNCTION__, timer.GetEPGUid());
-        LogDebug("%s: iMarginStart = %d", __FUNCTION__, timer.GetMarginStart());
-        LogDebug("%s: iMarginEnd = %d", __FUNCTION__, timer.GetMarginEnd());
-        LogDebug("%s: iGenreType = %d", __FUNCTION__, timer.GetGenreType());
-        LogDebug("%s: iGenreSubType = %d", __FUNCTION__, timer.GetGenreSubType());
-        LogDebug("%s: iRecordingGroup = %d", __FUNCTION__, timer.GetRecordingGroup());
+
+    PVR_ERROR TimersEngine::AddTimer(const kodi::addon::PVRTimer& timer) {
+        std::lock_guard lock(m_mutex);
+        m_timers.insert(std::make_unique<Timer>(timer));
+        m_cv.notify_all();
+        save_cache();
+        return PVR_ERROR_NO_ERROR;
     }
-    
+
+    PVR_ERROR TimersEngine::DeleteTimer(const kodi::addon::PVRTimer& timer, bool force) {
+        std::lock_guard lock(m_mutex);
+        
+        const auto it = std::find_if(m_timers.begin(), m_timers.end(),
+            [&](const auto& t) { 
+                return t->m_pvrTimer.GetClientIndex() == timer.GetClientIndex(); 
+            });
+        
+        if (it != m_timers.end()) {
+            if ((*it)->m_pvrTimer.GetState() == PVR_TIMER_STATE_RECORDING && !force) {
+                return PVR_ERROR_RECORDING_RUNNING;
+            }
+            (*it)->stop_recording(m_delegate);
+            m_timers.erase(it);
+            save_cache();
+            return PVR_ERROR_NO_ERROR;
+        }
+        return PVR_ERROR_INVALID_PARAMETERS;
+    }
+
+    PVR_ERROR TimersEngine::GetTimers(kodi::addon::PVRTimersResultSet& results) {
+        std::lock_guard lock(m_mutex);
+        for (const auto& timer : m_timers) {
+            results.Add(timer->m_pvrTimer);
+        }
+        return PVR_ERROR_NO_ERROR;
+    }
 }
-
-
