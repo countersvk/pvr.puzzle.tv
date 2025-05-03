@@ -1,14 +1,18 @@
-//
-//  base64 encoding and decoding with C++.
-//  Version: 1.01.00
-//
-
-#ifndef BASE64_H_C0CE2A47_D10E_42C9_A27C_C883944E704A
-#define BASE64_H_C0CE2A47_D10E_42C9_A27C_C883944E704A
+#pragma once
 
 #include <string>
+#include <span>
+#include <cstddef>
 
-std::string base64_encode(unsigned char const* , unsigned int len);
-std::string base64_decode(std::string const& s);
+namespace base64 {
 
-#endif /* BASE64_H_C0CE2A47_D10E_42C9_A27C_C883944E704A */
+    // Кодирование данных произвольного бинарного формата
+    [[nodiscard]] std::string encode(std::span<const std::byte> data) noexcept;
+
+    // Кодирование строковых данных (специализация для удобства)
+    [[nodiscard]] std::string encode(std::string_view str) noexcept;
+
+    // Декодирование base64 строки
+    [[nodiscard]] std::string decode(std::string_view encoded_str);
+
+} // namespace base64
