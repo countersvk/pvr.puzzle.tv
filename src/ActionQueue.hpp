@@ -1,156 +1,192 @@
-/*
- *
- *   Copyright (C) 2017 Sergey Shramchenko
- *   https://github.com/srg70/pvr.puzzle.tv
- *
- *  This Program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
- *  any later version.
- *
- *  This Program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with XBMC; see the file COPYING.  If not, write to
- *  the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
- *  http://www.gnu.org/copyleft/gpl.html
- *
- */
+#ifndef ACTION_QUEUE_HPP
+#define ACTION_QUEUE_HPP
 
-#ifndef Action_Queue_hpp
-#define Action_Queue_hpp
-
-
-#include "p8-platform/util/buffer.h"
-#include "p8-platform/threads/threads.h"
-#include "p8-platform/threads/mutex.h"
-#include "ActionQueueTypes.hpp"
-#include "globals.hpp"
+#include <kodi/AddonBase.h>       // Kodi 20+ API
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <thread>
 #include <exception>
-#include <stdexcept>
 #include <string>
-
+#include <memory>
 
 namespace ActionQueue
 {
     class ActionQueueException : public std::exception
     {
     public:
-        ActionQueueException(const char* reason = "") : r(reason){}
-        virtual const char* what() const noexcept {return r.c_str();}
+        ActionQueueException(const char* reason = "") : r(reason) {}
+        const char* what() const noexcept override { return r.c_str(); }
         
     private:
         std::string r;
     };
 
-    class CActionQueue : public P8PLATFORM::CThread
+    template<typename TAction, typename TCompletion>
+    class CActionQueue
     {
     private:
-//        template<typename TAction>
         class QueueItem : public IActionQueueItem
         {
         public:
             QueueItem(TAction action, TCompletion completion)
-            : _action(action)
-            , _completion(completion)
-            {}
-            virtual void Perform() {
+                : action_(std::move(action)), completion_(std::move(completion)) {}
+
+            void Perform() override 
+            {
                 try {
-                    _action();
-                    _completion(ActionResult(kActionCompleted));
+                    action_();
+                    completion_(ActionResult(kActionCompleted));
                 } catch (...) {
-                    Failed(std::current_exception());
+                    completion_(ActionResult(kActionFailed, std::current_exception()));
                 }
             }
-            virtual void Cancel() {_completion(ActionResult(kActionCancelled));}
-            
+
+            void Cancel() override 
+            {
+                completion_(ActionResult(kActionCancelled));
+            }
+
         private:
-            const TAction _action;
-            const TCompletion _completion;
-            void Failed(std::exception_ptr e) {_completion(ActionResult(kActionFailed, e));}
+            TAction action_;
+            TCompletion completion_;
         };
+
     public:
         CActionQueue(size_t maxSize, const char* name = "")
-        : _actions(maxSize)
-        , _willStop(false)
-        , _priorityAction(nullptr)
-        , _name(name)
-        {}
+            : max_size_(maxSize), name_(name), running_(false) {}
+
+        ~CActionQueue()
+        {
+            StopThread(5000);
+        }
 
         void PerformHiPriority(TAction action, TCompletion completion)
         {
-            using namespace P8PLATFORM;
-            
-            CEvent done;
-            TAction doneAction = [action, &done ](){
-                try{
-                    action();
-                    done.Signal();
-                } catch  (...){
-                    Globals::LogError("CActionQueue: execption during process HI-priority request!");
-                    done.Signal();
-                    throw;
-                }
-            };
-            auto item = new QueueItem(doneAction, completion);
-            if(_willStop){
-                item->Cancel();
-                done.Signal();
-                delete item;
-                item = nullptr;
-            } else {
-                if(_priorityAction != nullptr) // Can't be
-                    throw ActionQueueException("Too many priority tasks.");
-                {
-                    CLockObject lock(_priorityActionMutex);
-                    _priorityAction = item;
-                }
-                // In case when pipline has no tasks
-                // push dummy wakeup task
-                _actions.Push(new QueueItem([]{}, [](const ActionResult&){}));
+            std::unique_lock<std::mutex> lock(priority_mutex_);
+            if (priority_action_) {
+                throw ActionQueueException("Too many priority tasks");
             }
-            done.Wait();
+
+            auto item = std::make_unique<QueueItem>(std::move(action), std::move(completion));
+            priority_action_ = std::move(item);
+
+            // Wakeup worker thread
+            {
+                std::lock_guard<std::mutex> qlock(queue_mutex_);
+                queue_cond_.notify_one();
+            }
+
+            priority_cond_.wait(lock, [this] { return !priority_action_; });
         }
 
-//        template<typename TAction>
         void PerformAsync(TAction action, TCompletion completion)
         {
-            auto item = new QueueItem(action, completion);
-            if(!_willStop)
-                _actions.Push(item);
-            else{
-                item->Cancel();
-                delete item;
+            if (will_stop_) return;
+
+            std::unique_ptr<QueueItem> item = std::make_unique<QueueItem>(std::move(action), std::move(completion));
+            
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                if (queue_.size() >= max_size_) {
+                    throw ActionQueueException("Queue overflow");
+                }
+                queue_.push(std::move(item));
+            }
+            queue_cond_.notify_one();
+        }
+
+        bool StopThread(int waitMs = 5000)
+        {
+            will_stop_ = true;
+            queue_cond_.notify_all();
+
+            if (worker_.joinable()) {
+                if (waitMs > 0) {
+                    auto timeout = std::chrono::steady_clock::now() + 
+                                  std::chrono::milliseconds(waitMs);
+                    if (worker_.join_until(timeout)) {
+                        worker_.join();
+                        return true;
+                    }
+                }
+                worker_.detach();
+                return false;
+            }
+            return true;
+        }
+
+        void Start()
+        {
+            if (!running_) {
+                running_ = true;
+                worker_ = std::thread(&CActionQueue::Process, this);
             }
         }
-//        template<typename TAction>
-        void CancellAllBefore(TAction action, TCompletion completion)
-        {
-            // Set _willStop
-            TerminatePipeline();
-            // Reset _willStop when queue becomes empty
-            PerformAsync([]{}, [this, action, completion](const ActionResult& s) {
-                _willStop = false;
-                PerformAsync(action, completion);
-            });
-        }
-        virtual bool StopThread(int iWaitMs = 5000);
-        virtual ~CActionQueue(void);
-        
+
     private:
-        virtual void *Process(void);
-        void TerminatePipeline();
+        void Process()
+        {
+            kodi::addon::SetThreadName(GetCurrentThread(), name_.c_str());
+
+            while (running_) 
+            {
+                std::unique_ptr<QueueItem> item;
+                
+                // Check priority action first
+                {
+                    std::lock_guard<std::mutex> lock(priority_mutex_);
+                    if (priority_action_) {
+                        item = std::move(priority_action_);
+                    }
+                }
+
+                if (!item) {
+                    std::unique_lock<std::mutex> lock(queue_mutex_);
+                    queue_cond_.wait(lock, [this] { 
+                        return !queue_.empty() || !running_; 
+                    });
+
+                    if (!queue_.empty()) {
+                        item = std::move(queue_.front());
+                        queue_.pop();
+                    }
+                }
+
+                if (item) {
+                    try {
+                        if (will_stop_) item->Cancel();
+                        else item->Perform();
+                    } catch (...) {
+                        kodi::Log(ADDON_LOG_ERROR, "Unhandled exception in action queue");
+                    }
+                }
+
+                // Notify priority completion
+                if (priority_action_) {
+                    std::lock_guard<std::mutex> lock(priority_mutex_);
+                    priority_action_.reset();
+                    priority_cond_.notify_one();
+                }
+            }
+        }
+
+        const size_t max_size_;
+        std::string name_;
+        std::atomic_bool running_;
+        std::atomic_bool will_stop_{false};
         
-        typedef P8PLATFORM::SyncedBuffer <IActionQueueItem*> TActionQueue;
-        TActionQueue _actions;
-        P8PLATFORM::CMutex _priorityActionMutex;
-        IActionQueueItem* _priorityAction;
-        bool _willStop;
-        std::string _name;
-        
+        std::mutex queue_mutex_;
+        std::condition_variable queue_cond_;
+        std::queue<std::unique_ptr<QueueItem>> queue_;
+
+        std::mutex priority_mutex_;
+        std::condition_variable priority_cond_;
+        std::unique_ptr<QueueItem> priority_action_;
+
+        std::thread worker_;
     };
 }
-#endif /* Action_Queue_hpp */
+
+#endif // ACTION_QUEUE_HPP
