@@ -1,66 +1,24 @@
-/*
- *
- *   Copyright (C) 2017 Sergey Shramchenko
- *   https://github.com/srg70/pvr.puzzle.tv
- *
- *  This Program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
- *  any later version.
- *
- *  This Program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with XBMC; see the file COPYING.  If not, write to
- *  the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
- *  http://www.gnu.org/copyleft/gpl.html
- *
- */
-
-#include <vector>
-#include <iostream>
-#include <sstream>
-#include <random>
-#include <climits>
-#include <algorithm>
-#include <functional>
 #include <string>
+#include <random>
+#include <format>
+#include <array>
 
 namespace CUSTOM_GUID {
 
-unsigned char random_char() {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, 255);
-    return static_cast<unsigned char>(dis(gen));
+namespace {
+    thread_local std::mt19937 gen(std::random_device{}());
+    thread_local std::uniform_int_distribution<uint32_t> dist(0, UINT32_MAX);
 }
 
-std::string generate_hex(const unsigned int len) {
-    std::stringstream ss;
-    for(auto i = 0; i < len; i++) {
-        auto rc = random_char();
-        std::stringstream hexstream;
-        hexstream << std::hex << int(rc);
-        auto hex = hexstream.str();
-        ss << (hex.length() < 2 ? '0' + hex : hex);
-    }
-    return ss.str();
+std::string generate() {
+    // Генерация 128-битного UUID (16 bytes)
+    std::array<uint32_t, 4> data{dist(gen), dist(gen), dist(gen), dist(gen)};
+
+    return std::format("{:08x}-{:04x}-{:04x}-{:04x}-{:08x}{:04x}",
+        data[0],                        // 32 бита
+        data[1] & 0xFFFF,               // 16 бит
+        (data[1] >> 16) & 0x0FFF | 0x4000, // Версия 4
+        data[2] & 0x3FFF | 0x8000,      // Вариант 1
+        data[2] >> 16, data[3]);        // Остальные 48 бит
 }
-    std::string generate() {
-        std::string g_id = generate_hex(4);
-        g_id += '-';
-        g_id += generate_hex(2);
-        g_id += '-';
-        g_id += generate_hex(2);
-        g_id += '-';
-        g_id += generate_hex(2);
-        g_id += '-';
-        g_id += generate_hex(8);
-
-        return g_id;
-    }
-
 }
