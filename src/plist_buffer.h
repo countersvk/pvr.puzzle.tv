@@ -1,6 +1,6 @@
 /*
  *
- *   Copyright (C) 2019 Sergey Shramchenko
+ *   Copyright (C) 2017 Sergey Shramchenko
  *   https://github.com/srg70/pvr.puzzle.tv
  *
  *  This Program is free software; you can redistribute it and/or modify
@@ -20,71 +20,82 @@
  *
  */
 
-#ifndef __plist_buffer_delegate_h__
-#define __plist_buffer_delegate_h__
+#ifndef plist_buffer_h
+#define plist_buffer_h
 
-#include <memory>
-#include <ctime>
+#include <string>
+#include <vector>
+#include <list>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+
+#include "kodi/addon-instance/Inputstream.h"
+#include "kodi/addon-instance/PVR.h"
+#include "input_buffer.h"
+#include "plist_buffer_delegate.h"
 
 namespace Buffers
 {
-    class IPlaylistBufferDelegate
+    class Segment;
+    class MutableSegment;
+    class PlaylistCache;
+    
+    class PlaylistBuffer : public InputBuffer
     {
     public:
-        virtual ~IPlaylistBufferDelegate() = default;
+        PlaylistBuffer(const std::string &streamUrl, PlaylistBufferDelegate delegate, bool seekForVod);
+        ~PlaylistBuffer();
         
-        /**
-         * @brief Get the number of segments to cache
-         * @return Number of segments to keep in cache
-         */
-        virtual int SegmentsAmountToCache() const = 0;
+        const std::string& GetUrl() const { return m_url; };
+        int64_t GetLength() const override;
+        int64_t GetPosition() const override;
+        int64_t Seek(int64_t iPosition, int iWhence) override;
+        ssize_t Read(unsigned char *buffer, size_t bufferSize, uint32_t timeoutMs) override;
+        bool SwitchStream(const std::string &newUrl);
+        void AbortRead() override;
+        static int SetNumberOfHlsThreads(int numOfThreads);
         
-        /**
-         * @brief Get the total duration of the stream
-         * @return Duration in seconds
+        /*!
+         * @brief Stop the thread
+         * @param iWaitMs negative = don't wait, 0 = infinite, or the amount of ms to wait
          */
-        virtual time_t Duration() const = 0;
+        virtual bool StopThread(int iWaitMs = 5000);
         
-        /**
-         * @brief Get URL for timeshift playback
-         * @param timeshift Timeshift value in seconds
-         * @param timeshiftAdjusted Adjusted timeshift value (output parameter)
-         * @return URL for timeshift playback
-         */
-        virtual std::string UrlForTimeshift(time_t timeshift, time_t* timeshiftAdjusted) const = 0;
-        
-        /**
-         * @brief Check if stream is live
-         * @return true if live stream, false for VOD
-         */
-        virtual bool IsLive() const = 0;
-        
-        /**
-         * @brief Get current playback position
-         * @return Current position in seconds
-         */
-        virtual time_t GetCurrentPosition() const = 0;
-        
-        /**
-         * @brief Set current playback position
-         * @param position New position in seconds
-         */
-        virtual void SetCurrentPosition(time_t position) = 0;
-        
-        /**
-         * @brief Get minimum available timeshift
-         * @return Minimum timeshift in seconds
-         */
-        virtual time_t GetMinTimeshift() const = 0;
-        
-        /**
-         * @brief Get maximum available timeshift
-         * @return Maximum timeshift in seconds
-         */
-        virtual time_t GetMaxTimeshift() const = 0;
+    private:
+        mutable std::mutex m_syncAccess;
+        mutable std::condition_variable m_writeEvent;
+        PlaylistBufferDelegate m_delegate;
+        int64_t m_position;
+        PlaylistCache* m_cache;
+        Segment* m_currentSegment;
+        uint64_t m_segmentIndexAfterSeek;
+        std::string m_url;
+        const bool m_seekForVod;
+        static int s_numberOfHlsThreads;
+        bool m_isWaitingForRead;
+        bool m_stopped;
+        std::thread m_thread;
+
+        void Process();
+        void Init(const std::string &playlistUrl);
+        bool IsStopped(uint32_t timeoutInSec = 0);
+        void CreateThread();
     };
     
-    typedef std::shared_ptr<IPlaylistBufferDelegate> PlaylistBufferDelegate;
+    class PlistBufferException : public InputBufferException
+    {
+    public:
+        PlistBufferException(const char* reason = "")
+        : m_reason(reason)
+        , InputBufferException(NULL)
+        {}
+        virtual const char* what() const noexcept {return m_reason.c_str();}
+        
+    private:
+        std::string m_reason;
+    };
+    
 }
-
-#endif /* __plist_buffer_delegate_h__ */
+#endif //plist_buffer_h
