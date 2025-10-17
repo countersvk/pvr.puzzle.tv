@@ -28,8 +28,9 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <mutex>
 #include "cache_buffer.h"
-#include "p8-platform/threads/mutex.h"
+#include "kodi/AddonBase.h"
 
 namespace Buffers
 {
@@ -81,7 +82,7 @@ namespace Buffers
         
         mutable Chunks m_ReadChunks;
         ChunkSwarm m_ChunkSwarm;
-        mutable P8PLATFORM::CMutex m_SyncAccess;
+        mutable std::mutex m_SyncAccess;
         int64_t m_length;
         int64_t m_position;
         int64_t m_begin;// virtual start of cache
