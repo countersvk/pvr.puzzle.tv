@@ -24,18 +24,67 @@
 #define __plist_buffer_delegate_h__
 
 #include <memory>
+#include <ctime>
 
 namespace Buffers
 {
     class IPlaylistBufferDelegate
     {
     public:
-        virtual int SegmentsAmountToCache() const= 0;
-        virtual time_t Duration() const= 0;
+        virtual ~IPlaylistBufferDelegate() = default;
+        
+        /**
+         * @brief Get the number of segments to cache
+         * @return Number of segments to keep in cache
+         */
+        virtual int SegmentsAmountToCache() const = 0;
+        
+        /**
+         * @brief Get the total duration of the stream
+         * @return Duration in seconds
+         */
+        virtual time_t Duration() const = 0;
+        
+        /**
+         * @brief Get URL for timeshift playback
+         * @param timeshift Timeshift value in seconds
+         * @param timeshiftAdjusted Adjusted timeshift value (output parameter)
+         * @return URL for timeshift playback
+         */
         virtual std::string UrlForTimeshift(time_t timeshift, time_t* timeshiftAdjusted) const = 0;
-        virtual ~IPlaylistBufferDelegate() {}
+        
+        /**
+         * @brief Check if stream is live
+         * @return true if live stream, false for VOD
+         */
+        virtual bool IsLive() const = 0;
+        
+        /**
+         * @brief Get current playback position
+         * @return Current position in seconds
+         */
+        virtual time_t GetCurrentPosition() const = 0;
+        
+        /**
+         * @brief Set current playback position
+         * @param position New position in seconds
+         */
+        virtual void SetCurrentPosition(time_t position) = 0;
+        
+        /**
+         * @brief Get minimum available timeshift
+         * @return Minimum timeshift in seconds
+         */
+        virtual time_t GetMinTimeshift() const = 0;
+        
+        /**
+         * @brief Get maximum available timeshift
+         * @return Maximum timeshift in seconds
+         */
+        virtual time_t GetMaxTimeshift() const = 0;
     };
-    typedef  std::shared_ptr<IPlaylistBufferDelegate> PlaylistBufferDelegate;
+    
+    typedef std::shared_ptr<IPlaylistBufferDelegate> PlaylistBufferDelegate;
 }
 
 #endif /* __plist_buffer_delegate_h__ */
