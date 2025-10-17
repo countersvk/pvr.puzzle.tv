@@ -29,6 +29,7 @@
 #include <string>
 #include <memory>
 #include <exception>
+#include <cstdint>
 #include "Playlist.hpp"
 #include "plist_buffer_delegate.h"
 
