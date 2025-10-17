@@ -23,12 +23,16 @@
 #ifndef plist_buffer_h
 #define plist_buffer_h
 
-
 #include <string>
 #include <vector>
 #include <list>
-#include "p8-platform/threads/threads.h"
-#include "p8-platform/util/buffer.h"
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+
+#include "kodi/addon-instance/Inputstream.h"
+#include "kodi/addon-instance/PVR.h"
 #include "input_buffer.h"
 #include "plist_buffer_delegate.h"
 
@@ -38,20 +42,21 @@ namespace Buffers
     class MutableSegment;
     class PlaylistCache;
     
-    class PlaylistBuffer :  public InputBuffer, public P8PLATFORM::CThread
+    class PlaylistBuffer : public InputBuffer
     {
     public:
-        PlaylistBuffer(const std::string &streamUrl,  PlaylistBufferDelegate delegate, bool seekForVod);
+        PlaylistBuffer(const std::string &streamUrl, PlaylistBufferDelegate delegate, bool seekForVod);
         ~PlaylistBuffer();
         
         const std::string& GetUrl() const { return m_url; };
-        int64_t GetLength() const;
-        int64_t GetPosition() const;
-        int64_t Seek(int64_t iPosition, int iWhence);
-        ssize_t Read(unsigned char *buffer, size_t bufferSize, uint32_t timeoutMs);
+        int64_t GetLength() const override;
+        int64_t GetPosition() const override;
+        int64_t Seek(int64_t iPosition, int iWhence) override;
+        ssize_t Read(unsigned char *buffer, size_t bufferSize, uint32_t timeoutMs) override;
         bool SwitchStream(const std::string &newUrl);
-        void AbortRead();
-        static int SetNumberOfHlsTreads(int numOfTreads);
+        void AbortRead() override;
+        static int SetNumberOfHlsThreads(int numOfThreads);
+        
         /*!
          * @brief Stop the thread
          * @param iWaitMs negative = don't wait, 0 = infinite, or the amount of ms to wait
@@ -59,8 +64,8 @@ namespace Buffers
         virtual bool StopThread(int iWaitMs = 5000);
         
     private:
-        mutable P8PLATFORM::CMutex m_syncAccess;
-        mutable P8PLATFORM::CEvent m_writeEvent;
+        mutable std::mutex m_syncAccess;
+        mutable std::condition_variable m_writeEvent;
         PlaylistBufferDelegate m_delegate;
         int64_t m_position;
         PlaylistCache* m_cache;
@@ -70,12 +75,13 @@ namespace Buffers
         const bool m_seekForVod;
         static int s_numberOfHlsThreads;
         bool m_isWaitingForRead;
+        bool m_stopped;
+        std::thread m_thread;
 
-        void *Process();
+        void Process();
         void Init(const std::string &playlistUrl);
-//        bool FillSegment(MutableSegment* segment);
-//        bool FillSegmentFromPlaylist(MutableSegment* segment, const std::string& content);
         bool IsStopped(uint32_t timeoutInSec = 0);
+        void CreateThread();
     };
     
     class PlistBufferException : public InputBufferException
