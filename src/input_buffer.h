@@ -27,7 +27,8 @@
 #ifndef input_buffer_h
 #define input_buffer_h
 
-#include "p8-platform/os.h"
+// ЗАМЕНИЛ устаревший заголовок на современный
+#include "kodi/AddonBase.h"
 #include <stdint.h>
 #include <exception>
 #include <string>
