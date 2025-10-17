@@ -23,9 +23,9 @@
 #ifndef __puzzle_pvr_client_h__
 #define __puzzle_pvr_client_h__
 
-
 #include <string>
-#include "addon.h"
+#include <memory>
+#include "kodi/addon-instance/PVR.h"
 #include "pvr_client_base.h"
 
 class InputBuffer;
@@ -40,15 +40,16 @@ public:
     ADDON_STATUS Init(const std::string& clientPath, const std::string& userPath) override;
     ~PuzzlePVRClient();
 
-    ADDON_STATUS SetSetting(const std::string& settingName, const kodi::CSettingValue& settingValue) override;
+    ADDON_STATUS SetSetting(const std::string& settingName, const kodi::addon::CSettingValue& settingValue) override;
     
     PVR_ERROR GetAddonCapabilities(kodi::addon::PVRCapabilities& capabilities) override;
     
-    PVR_ERROR SignalStatus(int /*channelUid*/, kodi::addon::PVRSignalStatus& signalStatus) override;
+    PVR_ERROR SignalStatus(int channelUid, kodi::addon::PVRSignalStatus& signalStatus) override;
     
     PVR_ERROR CallChannelMenuHook(const kodi::addon::PVRMenuhook& menuhook, const kodi::addon::PVRChannel& item) override;
     
     bool OpenRecordedStream(const kodi::addon::PVRRecording& recording) override;
+    
 protected:
     virtual void OnOpenStremFailed(PvrClient::ChannelId channelId, const std::string& streamUrl) override;
     std::string GetStreamUrl(PvrClient::ChannelId channelId) override;
@@ -69,7 +70,6 @@ private:
     std::string m_serverUri;
     int m_maxServerRetries;
     std::string m_epgUrl;
-    //    bool m_shouldAddFavoritesGroup;
     int m_epgType;
     int m_epgPort;
     int m_serverVersion;
