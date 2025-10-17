@@ -35,9 +35,7 @@
 #include <functional>
 #include <list>
 #include <memory>
-#include "p8-platform/util/timeutils.h"
-#include "p8-platform/threads/mutex.h"
-
+#include <mutex>
 
 namespace XMLTV {
     struct EpgEntry;
@@ -46,7 +44,6 @@ namespace XMLTV {
 
 namespace PuzzleEngine
 {
-
     typedef std::map<std::string, std::string> ParamList;
 
     class AuthFailedException : public PvrClient::ExceptionBase
@@ -66,7 +63,6 @@ namespace PuzzleEngine
         const int code;
     };
 
-
     typedef enum {
         c_EpgType_File = 0,
         c_EpgType_Server = 1
@@ -80,16 +76,15 @@ namespace PuzzleEngine
     class PuzzleTV : public PvrClient::ClientCoreBase
     {
     public:
-        
         struct PuzzleSource
         {
             typedef std::map<std::string, bool> TStreamsQuality;
             
             PuzzleSource()
-            : IsServerOn (true)
-            , IsChannelLocked (false)
-            , Priority (0)
-            , Id (0)
+            : IsServerOn(true)
+            , IsChannelLocked(false)
+            , Priority(0)
+            , Id(0)
             {}
             
             bool IsServerOn;
@@ -99,21 +94,23 @@ namespace PuzzleEngine
             std::string Server;
             TStreamsQuality Streams;
             
-            bool IsOn() const {return IsServerOn && !IsChannelLocked; }
-            bool CanBeOn() const {return IsServerOn && IsChannelLocked; }
-            bool IsEmpty() const {return Streams.size() == 0; }
+            bool IsOn() const { return IsServerOn && !IsChannelLocked; }
+            bool CanBeOn() const { return IsServerOn && IsChannelLocked; }
+            bool IsEmpty() const { return Streams.empty(); }
         };
+        
         typedef std::string TCacheUrl;
-
         typedef std::map<TCacheUrl, PuzzleSource> TChannelSources;
         typedef const TChannelSources::value_type* TPrioritizedSource;
         
         struct PriorityComparator{
-          bool operator()(const TPrioritizedSource& left, const TPrioritizedSource& right) { return left->second.Priority > right->second.Priority; }
+            bool operator()(const TPrioritizedSource& left, const TPrioritizedSource& right) { 
+                return left->second.Priority > right->second.Priority; 
+            }
         };
-        typedef std::priority_queue<TPrioritizedSource, std::vector<TPrioritizedSource>, PriorityComparator >  TPrioritizedSources;
-
         
+        typedef std::priority_queue<TPrioritizedSource, std::vector<TPrioritizedSource>, PriorityComparator> TPrioritizedSources;
+
         PuzzleTV(ServerVersion serverVersion, const char* serverUrl, uint16_t serverPort);
         ~PuzzleTV();
 
@@ -123,19 +120,19 @@ namespace PuzzleEngine
         std::string GetNextStream(PvrClient::ChannelId channelId, int currentStreamIdx);
         void OnOpenStremFailed(PvrClient::ChannelId channelId, const std::string& streamUrl);
 
-        void SetMaxServerRetries(int maxServerRetries) {m_maxServerRetries = maxServerRetries;}
+        void SetMaxServerRetries(int maxServerRetries) { m_maxServerRetries = maxServerRetries; }
+        
         void SetEpgParams(EpgType epgType, const std::string& epgUrl, uint16_t serverPort) {
-            
             if(m_serverVersion == c_PuzzleServer3 && epgType == c_EpgType_Server) {
-                // Override settings for Puzzle 3 server (like a file)
                 m_epgUrl = EpgUrlForPuzzle3();
                 m_epgType = c_EpgType_File;
             } else {
                 m_epgUrl = epgUrl;
                 m_epgType = epgType;
-             }
+            }
             m_epgServerPort = serverPort;
         }
+        
         TPrioritizedSources GetSourcesForChannel(PvrClient::ChannelId channelId);
         void EnableSource(PvrClient::ChannelId channelId, const TCacheUrl& source);
         void DisableSource(PvrClient::ChannelId channelId, const TCacheUrl& source);
@@ -163,8 +160,10 @@ namespace PuzzleEngine
 
         template <typename TParser>
         void CallApiFunction(const ApiFunctionData& data, TParser parser);
+        
         template <typename TParser, typename TCompletion>
         void CallApiAsync(const ApiFunctionData& data, TParser parser, TCompletion completion);
+        
         template <typename TParser, typename TCompletion>
         void CallApiAsync(const std::string& strRequest, const std::string& name, TParser parser, TCompletion completion);
 
@@ -176,22 +175,17 @@ namespace PuzzleEngine
         uint16_t m_epgServerPort;
         EpgType m_epgType;
         int m_maxServerRetries;
-
         std::string m_epgUrl;
-
         std::map<PvrClient::ChannelId, PvrClient::ChannelId> m_epgToServerLut;
         const ServerVersion m_serverVersion;
-
         TChannelSourcesMap m_sources;
-        
         bool m_isAceRunning;
         
         // Archive
         struct ArchiveRecord{
-            //std::vector<std::string> urls;
             std::string id;
-            //time_t startTime;
         };
+        
         typedef std::map<time_t, ArchiveRecord> TArchiveRecords;
         
         struct ChannelArchiveInfo{
@@ -200,8 +194,9 @@ namespace PuzzleEngine
         };
 
         typedef std::map<PvrClient::ChannelId, ChannelArchiveInfo> TArchiveInfo;
-        mutable P8PLATFORM::CMutex m_archiveAccessMutex;
+        mutable std::mutex m_archiveAccessMutex;
         TArchiveInfo m_archiveInfo;
     };
 }
+
 #endif //__puzzle_tv_h__
