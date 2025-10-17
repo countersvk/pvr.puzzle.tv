@@ -28,7 +28,6 @@
 
 namespace Buffers
 {
-    using namespace P8PLATFORM;
     using namespace Globals;
     
     class CMemoryBlock
@@ -129,7 +128,7 @@ namespace Buffers
         {
             LogDebug("MemoryCacheBuffer::Seek. >>> Requested pos %lld", iPosition);
             
-            CLockObject lock(m_SyncAccess);
+            std::lock_guard<std::mutex> lock(m_SyncAccess);
             
             // Translate position to offset from start of buffer.
             if(iWhence == SEEK_CUR) {
@@ -168,7 +167,7 @@ namespace Buffers
     int64_t MemoryCacheBuffer::Length() {
         int64_t length = -1;
         {
-            //            CLockObject lock(m_SyncAccess);
+            //            std::lock_guard<std::mutex> lock(m_SyncAccess);
             length = m_length;
         }
         return length;
@@ -179,7 +178,7 @@ namespace Buffers
         
         int64_t pos = m_position;
         //        {
-        //            CLockObject lock(m_SyncAccess);
+        //            std::lock_guard<std::mutex> lock(m_SyncAccess);
         //            pos = m_position;
         //        }
         return pos;
@@ -194,7 +193,7 @@ namespace Buffers
         ChunkPtr chunk = NULL;
         while (totalBytesRead < bufferSize) {
             {
-                CLockObject lock(m_SyncAccess);
+                std::lock_guard<std::mutex> lock(m_SyncAccess);
                 unsigned int idx = GetChunkIndexFor(m_position);
                 chunk = (idx >= m_ReadChunks.size()) ? NULL : m_ReadChunks[idx];
                 if(NULL == chunk)  {
@@ -222,7 +221,7 @@ namespace Buffers
         }
         // Do we have memory before read position to free?
         if(GetChunkIndexFor(m_position) > 0) {
-            CLockObject lock(m_SyncAccess);
+            std::lock_guard<std::mutex> lock(m_SyncAccess);
             // Free oldest chunks at one MByte before max size
             // NOTE: write will not wait, just will drop current unit.
             while((m_length - m_begin) >= (m_maxSize - 1024*1024) && GetChunkIndexFor(m_position) > 0)
@@ -251,7 +250,7 @@ namespace Buffers
         }
         ChunkPtr chunk = nullptr;
         *pBuf = nullptr;
-        CLockObject lock(m_SyncAccess);
+        std::lock_guard<std::mutex> lock(m_SyncAccess);
         if(m_ReadChunks.size()) {
             chunk = m_ReadChunks.back();
             // If chunck is full?
@@ -298,7 +297,7 @@ namespace Buffers
 //            while (bufferSize) {
 //                // Create new chunk if nesessary
 //                if(NULL == chunk)  {
-//                    CLockObject lock(m_SyncAccess);
+//                    std::lock_guard<std::mutex> lock(m_SyncAccess);
 //                    if(m_ReadChunks.size()) {
 //                        chunk = m_ReadChunks.back();
 //                        // If chunck is full?
@@ -321,7 +320,7 @@ namespace Buffers
 //                // Write bytes
 //                ssize_t bytesWritten = 0;
 //                {
-//                    CLockObject lock(m_SyncAccess);
+//                    std::lock_guard<std::mutex> lock(m_SyncAccess);
 //                    bytesWritten = chunk->Write(buffer, bytesToWrite);
 //                    m_length += bytesWritten;
 //                }
