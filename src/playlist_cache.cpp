@@ -27,14 +27,14 @@
 #define NOMINMAX
 #include <algorithm>
 #include <inttypes.h>
-#include "p8-platform/os.h"
-#include "p8-platform/threads/mutex.h"
+#include "kodi/AddonBase.h"
+#include <thread>
+#include <chrono>
 #include <memory>
 #include <list>
 #include "playlist_cache.hpp"
 #include "Playlist.hpp"
 #include "globals.hpp"
-#include "httplib.h"
 
 using namespace Globals;
 
@@ -350,7 +350,7 @@ bool PlaylistCache::WaitForBitrate(unsigned int timeoutInSec) const
             return false;
         }
         LogDebug("PlaylistCache: waiting for bitrate calculation...");
-        P8PLATFORM::CEvent::Sleep(1000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
     return m_bitrate != 0;
 }
@@ -546,4 +546,3 @@ size_t MutableSegment::Seek(size_t position)
 
 
 }
-
