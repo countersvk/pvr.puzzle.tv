@@ -3,10 +3,6 @@
  *   Copyright (C) 2017 Sergey Shramchenko
  *   https://github.com/srg70/pvr.puzzle.tv
  *
- *  Copyright (C) 2013 Alex Deryskyba (alex@codesnake.com)
- *  https://bitbucket.org/codesnake/pvr.sovok.tv_xbmc_addon
- *
- *
  *  This Program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
  *  the Free Software Foundation; either version 2, or (at your option)
@@ -24,179 +20,60 @@
  *
  */
 
-#ifndef __puzzle_tv_h__
-#define __puzzle_tv_h__
+#ifndef __puzzle_pvr_client_h__
+#define __puzzle_pvr_client_h__
 
-#include "client_core_base.hpp"
 #include <string>
-#include <map>
-#include <queue>
-#include <vector>
-#include <functional>
-#include <list>
 #include <memory>
-#include <mutex>
+#include "kodi/addon-instance/PVR.h"
+#include "pvr_client_base.h"
 
-namespace XMLTV {
-    struct EpgEntry;
-    struct EpgChannel;
+class InputBuffer;
+
+namespace PuzzleEngine {
+    class PuzzleTV;
 }
 
-namespace PuzzleEngine
+class PuzzlePVRClient: public PvrClient::PVRClientBase
 {
-    typedef std::map<std::string, std::string> ParamList;
+public:
+    ADDON_STATUS Init(const std::string& clientPath, const std::string& userPath) override;
+    ~PuzzlePVRClient();
 
-    class AuthFailedException : public PvrClient::ExceptionBase
-    {
-    };
-
-    class MissingApiException : public PvrClient::ExceptionBase
-    {
-    public:
-        MissingApiException(const char* r) : ExceptionBase(r) {}
-    };
-
-    class ServerErrorException : public PvrClient::ExceptionBase
-    {
-    public:
-        ServerErrorException(const char* r, int c) : ExceptionBase(r), code(c) {}
-        const int code;
-    };
-
-    typedef enum {
-        c_EpgType_File = 0,
-        c_EpgType_Server = 1
-    } EpgType;
-
-    typedef enum {
-        c_PuzzleServer2 = 0,
-        c_PuzzleServer3 = 1
-    } ServerVersion;
+    ADDON_STATUS SetSetting(const std::string& settingName, const kodi::addon::CSettingValue& settingValue) override;
     
-    class PuzzleTV : public PvrClient::ClientCoreBase
-    {
-    public:
-        struct PuzzleSource
-        {
-            typedef std::map<std::string, bool> TStreamsQuality;
-            
-            PuzzleSource()
-            : IsServerOn(true)
-            , IsChannelLocked(false)
-            , Priority(0)
-            , Id(0)
-            {}
-            
-            bool IsServerOn;
-            bool IsChannelLocked;
-            int Id;
-            int Priority;
-            std::string Server;
-            TStreamsQuality Streams;
-            
-            bool IsOn() const { return IsServerOn && !IsChannelLocked; }
-            bool CanBeOn() const { return IsServerOn && IsChannelLocked; }
-            bool IsEmpty() const { return Streams.empty(); }
-        };
-        
-        typedef std::string TCacheUrl;
-        typedef std::map<TCacheUrl, PuzzleSource> TChannelSources;
-        typedef const TChannelSources::value_type* TPrioritizedSource;
-        
-        struct PriorityComparator{
-            bool operator()(const TPrioritizedSource& left, const TPrioritizedSource& right) { 
-                return left->second.Priority > right->second.Priority; 
-            }
-        };
-        
-        typedef std::priority_queue<TPrioritizedSource, std::vector<TPrioritizedSource>, PriorityComparator> TPrioritizedSources;
+    PVR_ERROR GetAddonCapabilities(kodi::addon::PVRCapabilities& capabilities) override;
+    
+    PVR_ERROR SignalStatus(int channelUid, kodi::addon::PVRSignalStatus& signalStatus) override;
+    
+    PVR_ERROR CallChannelMenuHook(const kodi::addon::PVRMenuhook& menuhook, const kodi::addon::PVRChannel& item) override;
+    
+    bool OpenRecordedStream(const kodi::addon::PVRRecording& recording) override;
+    
+protected:
+    virtual void OnOpenStremFailed(PvrClient::ChannelId channelId, const std::string& streamUrl) override;
+    std::string GetStreamUrl(PvrClient::ChannelId channelId) override;
+    std::string GetNextStreamUrl(PvrClient::ChannelId channelId) override;
+    ADDON_STATUS OnReloadEpg() override;
+    
+    ADDON_STATUS CreateCoreSafe(bool clearEpgCache) override;
+    void DestroyCoreSafe() override;
+    void PopulateSettings(PvrClient::AddonSettingsMutableDictionary& settings) override;
 
-        PuzzleTV(ServerVersion serverVersion, const char* serverUrl, uint16_t serverPort);
-        ~PuzzleTV();
+private:
+    void CreateCore(bool clearEpgCache);
+    void HandleStreamsMenuHook(PvrClient::ChannelId channelId);
 
-        void UpdateEpgForAllChannels(time_t startTime, time_t endTime, std::function<bool(void)> cancelled);
+    PuzzleEngine::PuzzleTV* m_puzzleTV;
+    int m_currentChannelStreamIdx;
+    uint16_t m_serverPort;
+    std::string m_serverUri;
+    int m_maxServerRetries;
+    std::string m_epgUrl;
+    int m_epgType;
+    int m_epgPort;
+    int m_serverVersion;
+    bool m_blockDeadStreams;
+};
 
-        std::string GetUrl(PvrClient::ChannelId channelId);
-        std::string GetNextStream(PvrClient::ChannelId channelId, int currentStreamIdx);
-        void OnOpenStremFailed(PvrClient::ChannelId channelId, const std::string& streamUrl);
-
-        void SetMaxServerRetries(int maxServerRetries) { m_maxServerRetries = maxServerRetries; }
-        
-        void SetEpgParams(EpgType epgType, const std::string& epgUrl, uint16_t serverPort) {
-            if(m_serverVersion == c_PuzzleServer3 && epgType == c_EpgType_Server) {
-                m_epgUrl = EpgUrlForPuzzle3();
-                m_epgType = c_EpgType_File;
-            } else {
-                m_epgUrl = epgUrl;
-                m_epgType = epgType;
-            }
-            m_epgServerPort = serverPort;
-        }
-        
-        TPrioritizedSources GetSourcesForChannel(PvrClient::ChannelId channelId);
-        void EnableSource(PvrClient::ChannelId channelId, const TCacheUrl& source);
-        void DisableSource(PvrClient::ChannelId channelId, const TCacheUrl& source);
-        void UpdateChannelSources(PvrClient::ChannelId channelId);
-        
-        std::string GetArchiveUrl(PvrClient::ChannelId channelId, time_t startTime);
-
-    protected:
-        void Init(bool clearEpgCache);
-        virtual void UpdateHasArchive(PvrClient::EpgEntry& entry);
-        void BuildChannelAndGroupList();
-
-    private:
-        typedef std::map<PvrClient::ChannelId, TChannelSources> TChannelSourcesMap;
-
-        struct ApiFunctionData;
-        PvrClient::UniqueBroadcastIdType AddXmlEpgEntry(const XMLTV::EpgEntry& xmlEpgEntry);
-        void LoadEpg(std::function<bool(void)> cancelled);
-        void UpdateArhivesAsync();
-        std::string GetRecordId(PvrClient::ChannelId channelId, time_t startTime);
-        
-        bool CheckChannelId(PvrClient::ChannelId channelId);
-        void UpdateUrlsForChannel(PvrClient::ChannelId channelId);
-        void Cleanup();
-
-        template <typename TParser>
-        void CallApiFunction(const ApiFunctionData& data, TParser parser);
-        
-        template <typename TParser, typename TCompletion>
-        void CallApiAsync(const ApiFunctionData& data, TParser parser, TCompletion completion);
-        
-        template <typename TParser, typename TCompletion>
-        void CallApiAsync(const std::string& strRequest, const std::string& name, TParser parser, TCompletion completion);
-
-        bool CheckAceEngineRunning(const char* aceServerUrlBase);
-        std::string EpgUrlForPuzzle3() const;
-
-        const uint16_t m_serverPort;
-        const std::string m_serverUri;
-        uint16_t m_epgServerPort;
-        EpgType m_epgType;
-        int m_maxServerRetries;
-        std::string m_epgUrl;
-        std::map<PvrClient::ChannelId, PvrClient::ChannelId> m_epgToServerLut;
-        const ServerVersion m_serverVersion;
-        TChannelSourcesMap m_sources;
-        bool m_isAceRunning;
-        
-        // Archive
-        struct ArchiveRecord{
-            std::string id;
-        };
-        
-        typedef std::map<time_t, ArchiveRecord> TArchiveRecords;
-        
-        struct ChannelArchiveInfo{
-            std::string archiveId;
-            TArchiveRecords records;
-        };
-
-        typedef std::map<PvrClient::ChannelId, ChannelArchiveInfo> TArchiveInfo;
-        mutable std::mutex m_archiveAccessMutex;
-        TArchiveInfo m_archiveInfo;
-    };
-}
-
-#endif //__puzzle_tv_h__
+#endif //__puzzle_pvr_client_h__
